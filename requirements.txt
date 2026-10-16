@@ -1,0 +1,28 @@
+# API & HTTP Clients
+openai==1.102.0
+requests==2.32.5
+
+# Utilities
+loguru>=0.7.0
+tqdm>=4.65.0
+PyYAML==6.0.2
+nanoid==2.0.0
+dotenv==0.9.9
+python-dotenv==1.1.1
+
+# Semantics and Graph Processing
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+transformers==4.51.1
+sentence-transformers==3.2.1
+bertopic==0.17.4
+faiss-cpu==1.9.0
+numpy==1.26.4
+scipy==1.15.3
+scikit-learn==1.7.1
+networkx==3.4.2
+umap-learn>=0.5.0
+hdbscan>=0.8.0
+jieba>=0.42.1
+pydantic-settings>=2.0.0
