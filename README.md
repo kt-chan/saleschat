@@ -1,6 +1,3 @@
-# README.md
-
-```markdown
 # 催收实时对话助手 (Credit Collection Real-time Assistant)
 
 基于 **10 万通催收会话** 构建的实时话术推荐系统。通过 LLM 离线打标、BERTopic 主题聚类、SOP 图谱构建与多路融合检索，在通话过程中为催收员推荐最佳话术，同时沉淀催收 SOP 知识图谱。
@@ -44,34 +41,34 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        离线层                                 │
-│                                                               │
-│  10万通ASR会话 (data/calls.jsonl)                             │
-│      ↓ parse_dialog                                           │
-│  parsed_calls.jsonl (结构化 turns + turn_id)                  │
-│      ↓ LLM 并发打标 (Session + Pair 两级)                     │
-│  session_labels.jsonl + pair_labels.jsonl                     │
-│      ↓ ConfigOptimizer (数据驱动 + 人工基线)                  │
-│  optimized_config.json                                        │
-│      ↓ 用优化配置构建                                          │
-│  ┌────────────┬────────────┬────────────┬────────────┐       │
-│  │ BERTopic   │ QA 库      │ SOP 图谱   │ Faiss 索引 │       │
-│  │ 7 主题     │ 数万 QA 对 │ 节点+跳转表│ 向量检索   │       │
-│  └────────────┴────────────┴────────────┴────────────┘       │
+│                       离线层                                │
+│                                                             │
+│  10万通ASR会话 (data/calls.jsonl)                           │
+│      ↓ parse_dialog                                         │
+│  parsed_calls.jsonl (结构化 turns + turn_id)                │
+│      ↓ LLM 并发打标 (Session + Pair 两级)                   │
+│  session_labels.jsonl + pair_labels.jsonl                   │
+│      ↓ ConfigOptimizer (数据驱动 + 人工基线)                │
+│  optimized_config.json                                      │
+│      ↓ 用优化配置构建                                       │
+│  ┌────────────┬────────────┬────────────┬────────────┐      │
+│  │ BERTopic   │ QA 库      │ SOP 图谱   │ Faiss 索引 │      │
+│  │ 7 主题     │ 数万 QA 对 │ 节点+跳转表│ 向量检索   │      │
+│  └────────────┴────────────┴────────────┴────────────┘      │
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
-│                        在线层                                 │
-│                                                               │
-│  ASR 实时文本                                                  │
-│      ↓ StateTracker (规则状态机, O(1) 跳转)                    │
-│  当前 SOP 阶段 + 意图 + 情绪                                   │
-│      ↓ 并行多路召回                                            │
-│  [主题] [向量] [标签] [图谱]                                   │
-│      ↓ RRF 融合 + 合规过滤                                     │
-│  Top-3 推荐话术 → 客服界面                                     │
-│                                                               │
-│  延迟 ≈ 200ms（预算 500ms）                                    │
+│                       在线层                                │
+│                                                             │
+│  ASR 实时文本                                               │
+│      ↓ StateTracker (规则状态机, O(1) 跳转)                 │
+│  当前 SOP 阶段 + 意图 + 情绪                                │
+│      ↓ 并行多路召回                                         │
+│  [主题] [向量] [标签] [图谱]                                │
+│      ↓ RRF 融合 + 合规过滤                                  │
+│  Top-3 推荐话术 → 客服界面                                  │
+│                                                             │
+│  延迟 ≈ 200ms（预算 500ms）                                 │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -81,40 +78,40 @@
 
 ```
 credit_collection_assistant/
-├── .env                        # 环境变量（不提交）
-├── .env.example                # 环境变量模板
-├── .vscode/                    # VS Code 调试配置
+├── .env                      # 环境变量（不提交）
+├── .env.example              # 环境变量模板
+├── .vscode/                  # VS Code 调试配置
 │   ├── launch.json
 │   ├── settings.json
 │   ├── tasks.json
 │   └── extensions.json
-├── data/                       # 输入数据
-│   └── calls.jsonl             # 10万通原始 ASR 会话
-├── output/                     # 输出产物（自动创建）
-│   ├── parsed_calls.jsonl      # 解析后的会话
-│   ├── session_labels.jsonl    # Session 级 LLM 标签
-│   ├── pair_labels.jsonl       # Pair 级 LLM 标签
-│   ├── optimized_config.json   # 优化后的配置
-│   ├── bertopic_model/         # BERTopic 模型
-│   ├── qa_pairs.json           # 经典 QA 库
-│   ├── sop_graph.json          # SOP 图谱
-│   ├── faiss/                  # 向量索引
-│   └── testset.jsonl           # 在线评测集
-├── log/                        # 日志目录（自动创建）
-│   ├── cca.log                 # 全量日志
-│   └── cca.error.log           # 错误日志
-├── cache/                      # LLM 打标缓存（自动创建）
+├── data/                     # 输入数据
+│   └── calls.jsonl           # 10万通原始 ASR 会话
+├── output/                   # 输出产物（自动创建）
+│   ├── parsed_calls.jsonl    # 解析后的会话
+│   ├── session_labels.jsonl  # Session 级 LLM 标签
+│   ├── pair_labels.jsonl     # Pair 级 LLM 标签
+│   ├── optimized_config.json # 优化后的配置
+│   ├── bertopic_model/       # BERTopic 模型
+│   ├── qa_pairs.json         # 经典 QA 库
+│   ├── sop_graph.json        # SOP 图谱
+│   ├── faiss/                # 向量索引
+│   └── testset.jsonl         # 在线评测集
+├── log/                      # 日志目录（自动创建）
+│   ├── cca.log               # 全量日志
+│   └── cca.error.log         # 错误日志
+├── cache/                    # LLM 打标缓存（自动创建）
 │   ├── llm_sessions/
 │   └── llm_pairs/
-├── config.py                   # 原始配置基线（人工经验）
-├── prompts.yaml                # LLM 打标 Prompt 模板
-├── settings.py                 # 环境变量加载
-├── logger.py                   # 日志配置
-├── utils.py                    # 工具：并发/重试/缓存
-├── offline.py                  # 离线层
-├── online.py                   # 在线层
-├── main.py                     # 主流程
-├── evaluate.py                 # 评测
+├── config.py                 # 原始配置基线（人工经验）
+├── prompts.yaml              # LLM 打标 Prompt 模板
+├── settings.py               # 环境变量加载
+├── logger.py                 # 日志配置
+├── utils.py                  # 工具：并发/重试/缓存
+├── offline.py                # 离线层
+├── online.py                 # 在线层
+├── main.py                   # 主流程
+├── evaluate.py               # 评测
 └── requirements.txt
 ```
 
@@ -606,22 +603,3 @@ Internal use only.
 - 项目负责人：[填写]
 - 技术支持：[填写]
 - 问题反馈：[填写]
-```
-
----
-
-## 补充建议
-
-如果想让 README 更完善，可以补充以下内容：
-
-| 章节 | 说明 |
-|------|------|
-| **CHANGELOG.md** | 版本变更记录 |
-| **CONTRIBUTING.md** | 团队协作规范 |
-| **docs/architecture.md** | 详细架构设计文档（含时序图） |
-| **docs/sop.md** | SOP 7 大阶段详细定义 |
-| **docs/evaluation.md** | 评测方案与指标说明 |
-| **LICENSE** | 许可证 |
-| **Makefile** | 常用命令封装（`make setup`、`make offline` 等） |
-
-需要我继续补充这些文件吗？
