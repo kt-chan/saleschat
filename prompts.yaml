@@ -1,3 +1,6 @@
+# prompts.yaml
+# 催收场景 LLM 打标 Prompt（Session 级 + Pair 级 + 合成级）
+
 session_prompt: |
   你是信用卡催收领域的业务专家与数据本体工程师。阅读完整对话，提取会话级标签。
 
@@ -27,8 +30,6 @@ session_prompt: |
   四、候选清单
   ============================================================
   逾期原因：{session_reasons}
-  坐席策略：{session_tactics}
-  客户异议：{session_objections}
   客户情绪：{session_emotions}
   合规检查点：{session_compliance}
   最终结果：{session_outcomes}
@@ -48,8 +49,12 @@ session_prompt: |
     "final_outcomes": ["部分承诺还款(PTP)"]
   }}
 
-  对话内容：
+  ============================================================
+  六、对话内容
+  ============================================================
   {session_text}
+
+
 pair_prompt: |
   你是信用卡催收话术打标与重写专家。输入为 session_content（全文背景）和 chunk_content（当前片段）。
 
@@ -61,20 +66,18 @@ pair_prompt: |
 
   【候选清单】（建议，不是封闭枚举）
     stage 候选：{sop_stages}
-    customer_intents 候选：{pair_intents}
+    customer_intents 候选：{unified_intents}
     customer_emotions 候选：{pair_emotions}
-    agent_actions 候选：{pair_actions}
-    keywords 候选：{pair_keywords}
-    tags 候选：{pair_tags}
     risk 候选等级：{pair_risk_levels} / 类型：{pair_risk_types}
 
   【打标规则】
-  - 输出 stage、customer_intents、customer_emotions、agent_actions、keywords、tags、risk。
+  - 输出 stage、customer_intents、customer_emotions、keywords、tags、risk。
   - 优先匹配【候选清单】；候选无合适项时，只有 chunk_content 有明确原文证据才可新增简短、规范、可复用的标签。
-  - customer_intents 只反映当前片段中客户发言明确表达的意图；不得根据催收员问句推测客户意图，不得用 session_content 中客户前文意图替代当前片段意图。
-  - agent_actions 只反映当前片段中催收员实际回复的动作；必须有当前催收员原文证据。没有施压措辞不得打“施压警告”，没有询问收入/资金不得打“财务探询”，没有渠道词不得打“还款渠道”。
   - stage 依据当前片段双方行为和催收员主要动作判断，不得仅因 session_content 处于某阶段而强行打该阶段。当前片段是解释账单调整方案、说明还款安排、客户对金额表达压力的，优先判断为“04 方案协商与签署”；只有明确出现施压、警告、后果升级等措辞才判断为“03 充分施压”。
+  - customer_intents 只反映当前片段中客户发言明确表达的意图；不得根据催收员问句推测客户意图，不得用 session_content 中客户前文意图替代当前片段意图。
   - customer_emotions 只依据客户当前发言语气和用词判断；无明确情绪证据输出空数组。
+  - keywords 捕抓上下文相关的关键信息，必须跟会话原文里出现的，并保持一致。关键捕抓信息包括 {pair_keywords}。
+  - tags 综合理解全篇会话，输出跟本会话主题相关的重要标签。这个由你生成任意合适的标签，不需要从原文提取，也不必跟会话原文一致。
   - 低信息量片段：数组字段输出空数组；stage 无法判断时输出空字符串；risk 输出 "None"。
   - 所有数组标签必须有 chunk_content 原文证据；无证据不得新增或推测。
 
@@ -125,7 +128,8 @@ pair_prompt: |
   7. 禁止反例：
     - “客户：6320也太多了，我每个月还6000多压力很大。”不合格：金额未脱敏且缺必要前文。
     - “催收员：黄女士，您听我说完，不是每个月都还6000多。这次处理完之后，您7月12号再还款……”不合格：称呼、金额、日期未脱敏。
-    必须改为类似：“客户：（前文：催收员告知本月需处理相关金额并称可减免相关费用、下次还款到相关时间）相关金额也太多了，我每个月还相关金额压力很大。”
+    必须改为类似：
+    “客户：（前文：催收员告知本月需处理相关金额并称可减免相关费用、下次还款到相关时间）相关金额也太多了，我每个月还相关金额压力很大。”
     “催收员：您听我说完，不是每个月都还相关金额。这次处理完之后，您到相关时间再还款，中间相关时间不用还。而且之后您还可以再跟银行沟通协商，看有没有更适合您的方案。”
 
   【输出 JSON】
@@ -133,7 +137,6 @@ pair_prompt: |
     "stage": "",
     "customer_intents": [],
     "customer_emotions": [],
-    "agent_actions": [],
     "keywords": [],
     "tags": [],
     "risk": "None",
@@ -141,89 +144,36 @@ pair_prompt: |
     "rewritten_answer": "催收员："
   }
 
-  
-  【输入】
-  全文背景：
+  ============================================================
+  输入
+  ============================================================
+  【全文背景】
   {session_content}
 
-  当前片段：
+  【当前片段】
   {chunk_content}
 
-pair_prompt_v0.1 : |
-  你是信用卡催收话术打标与重写专家。输入为 session_content（全文背景）和 chunk_content（当前片段）。
+
+golden_script_prompt: |
+  你是顶级催收培训专家。我们正在为 SOP 图谱中的一个节点生成「经典 Q&A 话术对」。
+  
+  【当前节点】Stage: {stage} | 客户意图: {intent}
+  【历史真实语料】（以下为该节点命中过的真实对话，已脱敏）
+  {samples}
 
   【任务】
-    1. 依据【打标规则 和 【候选清单】，只对 chunk_content 打标；session_content 仅用于背景消歧和补充必要前文。
-    2. 依据【重写规则】和 【脱敏强制规则】，只对 chunk_content 改写，输出rewritten_question 和 rewritten_answer
-    3. 依据【输出前强制检查】，输出前必须检查并修正 rewritten_question 和 rewritten_answer。
-  
-  【候选清单】（建议，不是封闭枚举）  
-    stage 候选：{sop_stages}
-    customer_intents 候选：{pair_intents}
-    customer_emotions 候选：{pair_emotions}
-    agent_actions 候选：{pair_actions}
-    keywords 候选：{pair_keywords}
-    tags 候选：{pair_tags}
-    risk 候选等级：{pair_risk_levels} / 类型：{pair_risk_types}
+  综合以上语料，归纳提炼出 3-5 个最高频、最具代表性的「经典 Q&A 对」。
+  要求：
+  1. **经典问题 (question)**：提炼客户的核心诉求/异议，必须脱敏，使用 [金额]、[时间] 等占位符，要泛化，不要照抄原话。
+  2. **经典解答 (answer)**：逻辑清晰（共情 → 陈述事实 → 引导方案），严格合规，提供实质性解法。
+  3. 每个回答 30-100 字。
 
-  【打标规则】
-    - 输出 stage、customer_intents、customer_emotions、agent_actions、keywords、tags、risk。
-    - 优先匹配【候选清单】；候选无合适项时，只有 chunk_content 有明确原文证据才可新增简短、规范、可复用的标签。
-    - customer_intents 只反映客户发言中明确表达的意图，不得根据催收员问句推测客户意图。
-    - agent_actions 只反映当前片段中催收员实际回复的动作。
-    - 不得仅因 session_content 处于某阶段，就强行给当前片段打该阶段标签。
-    - 低信息量片段：数组字段输出空数组；stage 无法判断时输出空字符串；risk 输出 "None"。
-
-  【脱敏强制规则】
-    rewritten_question 和 rewritten_answer 两个字段都必须逐项扫描并替换，不得只处理其中一个字段。
-    - 客户名称/称呼：替换为“您”或删除。
-    - 所有金额：包括总欠款、最低还款额、减免金额、分期金额、每月还款金额、违约金、客户自述手头金额、房租/药费等具体数额，一律替换为“相关金额”。不得保留“6800”“2000多”“1200元”等任何具体数字金额。
-    - 时间类：日期、期限、延期天数、宽限到下周/后天等，替换为“相关时间”或“尽快”。
-    - 期数：替换为“相关期数”。
-    - 号码、地址、账号等：删除或替换为“相关联系方式”。
-
-  【重写规则】
-    rewritten_question：
-    - 以“客户：”开头。
-    - 必须脱敏泛化，遵循【脱敏强制规则】
-    - 只写“当前片段之前的必要前文 + 当前片段中客户的发言”。
-    - 必要前文指：触发当前客户发言的最近一轮催收员问句/引导语；只取必要内容，不要过度截取全文。
-    - 若当前片段以客户短应答开头（如“对，你好”“嗯”“是”），必须补上触发该应答的催收员前文；不得只写“客户：对，你好。”
-    - 严禁写入当前片段中催收员的任何回复。
-    - 若当前片段客户无发言，使用当前片段之前最近的客户表达与必要前文，不得用催收员回复填充。
-    
-    rewritten_answer：
-    - 以“催收员：”开头。
-    - 必须脱敏泛化，遵循【脱敏强制规则】
-    - 必须基于当前片段中催收员的回复改写，不得独立生成。
-    - 最大限度保留原文措辞、语序、语气和沟通意图，仅做脱敏替换或删除。
-    - 不得新增原文没有的合规提示、承诺、方案或解释。
-    - 若原文有具体还款方案、减免、分期、宽限等表达，只脱敏其中的金额、日期、期限、期数等信息，保留原有表达。
-    - 若当前片段确无催收员回复，才可按当前 SOP 阶段生成通用合规话术。
-
-  【输出前强制检查】
-    1. rewritten_question 是否包含“必要前文 + 当前客户发言”？若只有客户短应答，视为不合格，必须补前文。
-    2. rewritten_question 是否混入了当前片段催收员回复？若混入，必须删除。
-    3. rewritten_answer 是否基于当前片段催收员回复改写，而不是独立生成？
-    4. 分别扫描 rewritten_question 和 rewritten_answer：凡出现阿拉伯数字、中文数字金额、“X多”“X块”“X元”等金额表达，一律替换为“相关金额”；凡出现客户称呼、日期、期限、期数、号码，一律替换或删除。任一字段保留敏感信息即不合格。
-    5. 打标数组是否有 chunk_content 原文证据？无证据不得新增或推测。
-
-  【输出 JSON】
+  输出 JSON 格式（严格遵守）：
   {
-    "stage": "",
-    "customer_intents": [],
-    "customer_emotions": [],
-    "agent_actions": [],
-    "keywords": [],
-    "tags": [],
-    "risk": "None",
-    "rewritten_question": "客户：",
-    "rewritten_answer": "催收员："
+    "golden_qa_pairs": [
+      {
+        "question": "客户表示最近失业了，暂时没钱还[金额]。",
+        "answer": "理解您的困难，找工作需要时间。为了避免影响您的征信，我们可以先为您申请[时间]的延期，您看可以吗？"
+      }
+    ]
   }
-
-  【输入】
-  全文背景：
-  {session_content}
-
-  当前片段：
-  {chunk_content}

@@ -1,108 +1,95 @@
-import os, time, json, shutil, argparse
-import jieba
+import json, shutil, argparse
 from settings import get_settings
 from logger import get_logger
-from offline import (
-    load_calls,
-    LLMLabeler,
-    BERTopicBuilder,
-    QAExtractor,
-    SOPGraphBuilder,
-    VectorIndexBuilder,
-)
+from utils import init_db, clear_system_data
+from offline import load_calls, LLMLabeler, PgvectorWriter, GoldenScriptGenerator
 from online import RealtimeRecommender
+import config as raw_config
 
 log = get_logger(__name__)
 
 
-def clear_cache():
-    cfg = get_settings()
-    for p in [cfg.cache_path, cfg.output_path]:
-        if p.exists():
-            for item in p.iterdir():
-                shutil.rmtree(item) if item.is_dir() else item.unlink()
-    log.info("系统缓存已清空")
-
-
 def offline_pipeline():
     cfg = get_settings()
-    if cfg.clear_cache_on_start:
-        clear_cache()
 
-    log.info("阶段1: 加载解析会话")
+    if cfg.clear_cache_on_start:
+        clear_system_data()
+
+    init_db()
+
+    log.info("=== 阶段1: 解析原始会话 ===")
     calls = load_calls(cfg.calls_file)
     if not calls:
         return
-    if cfg.save_parsed_calls:
-        with open(cfg.parsed_calls_path, "w", encoding="utf-8") as f:
-            for c in calls:
-                f.write(json.dumps(c, ensure_ascii=False) + "\n")
 
-    log.info("阶段2: LLM 双级打标与脱敏重写")
+    log.info("=== 阶段2: LLM 双级打标 (自动落盘) ===")
     labeler = LLMLabeler()
-    sess_labels = labeler.run_sessions(calls, cfg.session_labels_file)
-    pair_labels = labeler.run_pairs(calls, cfg.pair_labels_file)
+    sessions = labeler.run_sessions(calls)
+    pairs = labeler.run_pairs(calls)
 
-    log.info("阶段3: 构建 BERTopic 导出向量")
-    docs = [
-        " ".join(jieba.cut(p["rewritten_question"]))
-        for p in pair_labels
-        if p and p.get("risk") != "High" and len(p.get("rewritten_question", "")) > 3
-    ]
-    if docs:
-        BERTopicBuilder().build_and_export(docs)
+    log.info("=== 阶段3: 向量化入库 ===")
+    PgvectorWriter().write(pairs, sessions)
 
-    log.info("阶段4: 抽取脱敏 QA 库")
-    qa_pairs = QAExtractor(calls, sess_labels, pair_labels).extract()
-    with open(cfg.qa_pairs_file, "w", encoding="utf-8") as f:
-        json.dump(qa_pairs, f, ensure_ascii=False, indent=2)
-
-    log.info("阶段5: 构建 Node 图谱与向量索引")
-    graph = SOPGraphBuilder(qa_pairs).build()
+    log.info("=== 阶段4: 图谱合成经典 Q&A (自动落盘) ===")
+    graph = GoldenScriptGenerator().build_graph()
     with open(cfg.sop_graph_file, "w", encoding="utf-8") as f:
         json.dump(graph, f, ensure_ascii=False, indent=2)
-    VectorIndexBuilder().build(qa_pairs)
-    log.info("✅ 离线流程完成")
+    log.info(f"✅ SOP 图谱已保存至 {cfg.sop_graph_file}")
+
+    log.info("🎉 离线流程全部完成")
 
 
 def online_demo():
-    log.info("启动在线推荐演示")
+    log.info("=== 在线实时推理测试 (多轮合并 & 配置控制状态机) ===")
     rec = RealtimeRecommender()
+
+    # 客户：
+    testquestion = "催收员告知可申请延期3天处理剩余1900元相关金额并申请减免违约金）后天？后天我也不敢保证能借到。"
     dialog = [
-        ("催收员", "喂，您好，招商银行。请问是张先生吗？"),
+        ("坐席", "您好，请问是张先生吗？"),
         ("客户", "是我。"),
-        ("催收员", "您名下信用卡本期逾期了，最低还款6800元。"),
-        ("客户", "我上个月被裁员了，现在没钱，能下个月还吗？"),
-        ("催收员", "理解。那您可以先还一点表达意愿。"),
-        ("客户", "那我找朋友凑一下，明天给你答复行不行？"),
+        ("坐席", "您名下信用卡本期逾期1900元，请问能处理吗？"),
+        ("客户", "我最近被裁员了，没钱。"),
+        ("坐席", "理解。那能不能找朋友凑一下？"),
+        ("客户", testquestion),
     ]
 
-    rec.init_session("demo")
+    print("\n--- 历史会话过程 ---")
+    for role, text in dialog:
+        print(f"[{role}] {text}")
 
-    # 1) 把整段会话拼接成一个查询问题（保留角色标签，便于模型区分谁在说）
-    query = "\n".join(f"{role}：{text}" for role, text in dialog)
-    # 若希望更贴近“一个问题”，也可以在最前面加一句总结性提问，例如：
-    # query = "以下是催收员与客户的完整对话，请判断当前阶段并推荐催收员下一句应说的话：\n" + query
+    # 提取客户的每一句话，合并成一个大 Query
+    customer_statements = [f"{role}:{text}" for role, text in dialog]
+    merged_query = " ".join(customer_statements)
 
-    log.info(f"\n[拼接后的会话查询]\n{query}")
+    print(f"\n🔍 触发多轮合并一次查询: {merged_query}")
 
-    res = rec.on_asr("demo", "客户", query)
+    sid = "demo_session"
+    # 初始化会话状态为起点
+    rec.store.set(sid, {"stage": raw_config.SOP_STAGES[0], "history": []})
 
-    # 3) 统一输出一次结果
+    # 把合并后的客户发言，作为单次客户输入丢给 on_asr
+    res = rec.on_asr(sid, "客户", merged_query)
+
     if res:
-        log.info(
-            f"  👉 Stage: {res['stage']} | Intent: {res['intent']} "
-            f"(判决: {res['decision']['decision']})"
+        print(
+            f"\n👉 最终命中阶段: {res['stage']} | 意图: {res['intent']} | 耗时: {res['latency_ms']}ms"
         )
-        for i, r in enumerate(res["recs"], 1):
-            log.info(f"     {i}. [{r['score']}] {r['answer']}")
+        if res.get("reject"):
+            print(f"  🚫 拒答原因: {res['reject_reason']}")
+        elif res["recs"]:
+            print(f"  🏆 推荐经典 Q&A:")
+            print(f"     Q: {res['recs'][0]['question']}")
+            print(f"     A: {res['recs'][0]['answer']}")
+        elif res["fallback"]:
+            print(f"  ⚠️ 兜底话术: {res['fallback'][0]['answer']}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["offline", "online", "all"], default="all")
+    parser.add_argument("--mode", choices=["offline", "online"], default="offline")
     args = parser.parse_args()
-    if args.mode in ["offline", "all"]:
+    if args.mode == "offline":
         offline_pipeline()
-    if args.mode in ["online", "all"]:
+    elif args.mode == "online":
         online_demo()

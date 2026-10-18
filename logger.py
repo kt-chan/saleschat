@@ -2,36 +2,32 @@ import sys
 from loguru import logger
 from settings import get_settings
 
-def setup_logger(name: str = "cca"):
+
+def setup_logger():
     cfg = get_settings()
     logger.remove()
-    
-    # 动态读取控制台与文件配置
-    if cfg.log_enable_console:
-        logger.add(sys.stderr, level=cfg.log_level, format=cfg.log_format, colorize=True)
-        
-    if cfg.log_enable_file:
-        logger.add(
-            cfg.log_path / f"{name}.log", 
-            level=cfg.log_level, 
-            format=cfg.log_format,
-            rotation=cfg.log_rotation, 
-            retention=cfg.log_retention, 
-            encoding="utf-8", 
-            enqueue=True
-        )
-        logger.add(
-            cfg.log_path / f"{name}.error.log", 
-            level="ERROR", 
-            format=cfg.log_format,
-            rotation=cfg.log_rotation, 
-            retention=cfg.log_retention, 
-            encoding="utf-8", 
-            enqueue=True
-        )
-    return logger
+    fmt = "<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | <cyan>{function}</cyan> | <level>{message}</level>"
+    logger.add(sys.stderr, level=cfg.log_level, format=fmt, colorize=True)
+    logger.add(
+        cfg.log_path / "cca.log",
+        level=cfg.log_level,
+        rotation="100 MB",
+        retention="7 days",
+        encoding="utf-8",
+        enqueue=True,
+    )
+    logger.add(
+        cfg.log_path / "error.log",
+        level="ERROR",
+        rotation="100 MB",
+        retention="7 days",
+        encoding="utf-8",
+        enqueue=True,
+    )
 
-def get_logger(module_name: str):
-    return logger.bind(module=module_name)
 
 setup_logger()
+
+
+def get_logger(name):
+    return logger.bind(module=name)

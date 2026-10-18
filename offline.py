@@ -1,140 +1,183 @@
-from datetime import datetime
-import re, json, time, yaml
+import re, json, yaml
 from pathlib import Path
 from typing import List, Dict
-import numpy as np
-import faiss
-import jieba
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
-from bertopic import BERTopic
-from bertopic.vectorizers import ClassTfidfTransformer
-from umap import UMAP
-from hdbscan import HDBSCAN
+from psycopg2.extras import execute_values
 
 import config as raw_config
 from settings import get_settings
 from logger import get_logger
-from utils import retry, parallel_map, FileCache
+from utils import retry, parallel_map, get_db_conn, release_db_conn, safe_json_loads
 
 log = get_logger(__name__)
 
-ROLE_PATTERN = re.compile(r'^(催收员|客户|客服|坐席|用户)[：:](.*)$')
-SPLIT_PATTERN = re.compile(r'[；;]')
-ROLE_NORMALIZE = {"客服": "催收员", "坐席": "催收员", "用户": "客户"}
 
 def parse_dialog(text: str) -> List[Dict]:
-    if not text: return []
+    if not text:
+        return []
     turns, turn_id = [], 0
-    for part in SPLIT_PATTERN.split(text):
+    for part in re.split(r"[；;]", text):
         part = part.strip()
-        if not part: continue
-        m = ROLE_PATTERN.match(part)
-        if not m: continue
-        role = ROLE_NORMALIZE.get(m.group(1), m.group(1))
-        content = m.group(2).strip()
-        if content:
-            turns.append({"turn_id": turn_id, "role": role, "text": content})
-            turn_id += 1
+        m = re.match(r"^(催收员|客户|客服|坐席|用户)[：:](.*)$", part)
+        if m:
+            role = {"客服": "催收员", "坐席": "催收员", "用户": "客户"}.get(
+                m.group(1), m.group(1)
+            )
+            content = m.group(2).strip()
+            if content:
+                turns.append({"turn_id": turn_id, "role": role, "text": content})
+                turn_id += 1
     return turns
+
 
 def load_calls(path: str) -> List[Dict]:
     p = Path(path)
-    if not p.exists(): return []
+    if not p.exists():
+        log.error(f"文件不存在: {path}")
+        return []
     calls, skipped, raw_objs = [], 0, []
     if p.suffix.lower() == ".jsonl":
         with open(p, "r", encoding="utf-8") as f:
             for line in f:
-                if line.strip(): raw_objs.append(json.loads(line.strip()))
+                if line.strip():
+                    raw_objs.append(json.loads(line.strip()))
     else:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
             raw_objs = data if isinstance(data, list) else data.get("calls", [])
-            
+
     for obj in raw_objs:
         obj["turns"] = parse_dialog(obj.get("text", ""))
-        if len(obj["turns"]) >= 2: calls.append(obj)
-        else: skipped += 1
+        if len(obj["turns"]) >= 2:
+            calls.append(obj)
+        else:
+            skipped += 1
     log.info(f"加载完成: 有效 {len(calls)} 通, 跳过 {skipped} 通")
     return calls
 
-def pair_turns(turns: List[Dict]) -> List[Dict]:
-    pairs = []
-    for i, t in enumerate(turns):
-        if t["role"] != "客户": continue
-        for j in range(i + 1, min(i + 3, len(turns))):
-            if turns[j]["role"] == "催收员":
-                pairs.append({"q_idx": i, "a_idx": j, "question": t["text"], "answer": turns[j]["text"]})
-                break
+
+def merge_consecutive(turns: List[Dict], sep: str = "") -> List[Dict]:
+    """把连续同角色的 turn 合并成块，保留原始索引范围。"""
+    blocks: List[Dict] = []
+    for idx, t in enumerate(turns):
+        if blocks and blocks[-1]["role"] == t["role"]:
+            blocks[-1]["text"] += sep + t["text"]
+            blocks[-1]["end_idx"] = idx
+        else:
+            blocks.append(
+                {
+                    "role": t["role"],
+                    "text": t["text"],
+                    "start_idx": idx,
+                    "end_idx": idx,
+                }
+            )
+    return blocks
+
+
+def pair_turns(turns: List[Dict], sep: str = "") -> List[Dict]:
+    """合并连续对话，输出 QA 对。"""
+    blocks = merge_consecutive(turns, sep=sep)
+    pairs: List[Dict] = []
+    i = 0
+    while i < len(blocks):
+        b = blocks[i]
+        if b["role"] != "客户":
+            i += 1  # 开头的孤立催收员块，跳过
+            continue
+
+        # 客户块后面紧跟催收员块 → 组成一对
+        if i + 1 < len(blocks) and blocks[i + 1]["role"] == "催收员":
+            a = blocks[i + 1]
+            pairs.append(
+                {
+                    "q_idx": (b["start_idx"], b["end_idx"]),
+                    "a_idx": (a["start_idx"], a["end_idx"]),
+                    "question": b["text"],
+                    "answer": a["text"],
+                }
+            )
+            i += 2
+        else:
+            # 客户块后面没有回答（会话结尾）
+            pairs.append(
+                {
+                    "q_idx": (b["start_idx"], b["end_idx"]),
+                    "a_idx": None,
+                    "question": b["text"],
+                    "answer": None,
+                }
+            )
+            i += 1
     return pairs
 
-class PromptLoader:
-    def __init__(self):
-        self.cfg = get_settings()
-        with open(self.cfg.prompt_file, "r", encoding="utf-8") as f:
-            self.tpls = yaml.safe_load(f)
-
-    def get_session(self):
-        return self.tpls["session_prompt"] \
-            .replace("{sop_stages}", "、".join(raw_config.SOP_STAGES)) \
-            .replace("{session_reasons}", "、".join(raw_config.SESSION_REASONS)) \
-            .replace("{session_tactics}", "、".join(raw_config.SESSION_TACTICS)) \
-            .replace("{session_objections}", "、".join(raw_config.SESSION_OBJECTIONS)) \
-            .replace("{session_emotions}", "、".join(raw_config.SESSION_EMOTIONS)) \
-            .replace("{session_compliance}", "、".join(raw_config.SESSION_COMPLIANCE)) \
-            .replace("{session_outcomes}", "、".join(raw_config.SESSION_OUTCOMES))
-
-    def get_pair(self):
-        return self.tpls["pair_prompt"] \
-            .replace("{sop_stages}", "、".join(raw_config.SOP_STAGES)) \
-            .replace("{pair_intents}", "、".join(raw_config.UNIFIED_INTENTS)) \
-            .replace("{pair_emotions}", "、".join(raw_config.PAIR_EMOTIONS)) \
-            .replace("{pair_actions}", "、".join(raw_config.PAIR_ACTIONS)) \
-            .replace("{pair_keywords}", "、".join(raw_config.PAIR_KEYWORDS)) \
-            .replace("{pair_tags}", "、".join(raw_config.PAIR_TAGS)) \
-            .replace("{pair_risk_levels}", "、".join(raw_config.PAIR_RISK_LEVELS)) \
-            .replace("{pair_risk_types}", "、".join(raw_config.PAIR_RISK_TYPES))
 
 class LLMLabeler:
     def __init__(self):
-        self.cfg = get_settings()
-        self.client = OpenAI(api_key=self.cfg.llm_api_key, base_url=self.cfg.llm_base_url, timeout=self.cfg.llm_timeout)
-        self.prompts = PromptLoader()
-        self.sess_cache = FileCache(self.cfg.cache_path, "llm_sessions")
-        self.pair_cache = FileCache(self.cfg.cache_path, "llm_pairs")
+        cfg = get_settings()
+        self.client = OpenAI(
+            api_key=cfg.llm_api_key, base_url=cfg.llm_base_url, timeout=60
+        )
+        with open(cfg.prompt_file, "r", encoding="utf-8") as f:
+            self.prompts = yaml.safe_load(f)
 
     @retry()
     def _call(self, prompt):
         resp = self.client.chat.completions.create(
-            model=self.cfg.llm_model, messages=[{"role": "user", "content": prompt}],
-            temperature=self.cfg.llm_temperature, response_format={"type": "json_object"}
+            model=get_settings().llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            response_format={"type": "json_object"},
         )
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        log.debug(f"@{ts}：LLM 打标 Prompt: {prompt[:16000]}...")
-        log.debug(f"@{ts}：Result: {resp.choices[0].message.content[:2000]}...")
-        return json.loads(resp.choices[0].message.content)
+        log.debug(f"prompt: {prompt}")
+        log.debug(f"response: {resp.choices[0].message.content}")
+        return safe_json_loads(resp.choices[0].message.content)
 
-    def _fmt(self, turns): return "\n".join([f"{t['role']}: {t['text']}" for t in turns])
+    def _fmt(self, turns):
+        return "\n".join([f"{t['role']}: {t['text']}" for t in turns])
 
-    def run_sessions(self, calls, out_path):
-        log.info(f"Session 打标: {len(calls)} 通")
+    def run_sessions(self, calls):
         def label(call):
-            if (c := self.sess_cache.get(call["call_id"])): return c
-            prompt = self.prompts.get_session().replace("{session_text}", self._fmt(call["turns"]))
-            try: res = self._call(prompt)
-            except Exception as e:
-                log.error(f"Session 打标失败 {call['call_id']}: {e}")
-                res = {"ptp": False, "sop_stages": [], "final_outcomes": []}
+            text = "\n".join([f"{t['role']}: {t['text']}" for t in call["turns"]])
+            try:
+                prompt = (
+                    self.prompts["session_prompt"]
+                    .replace("{session_text}", text)
+                    .replace("{sop_stages}", "、".join(raw_config.SOP_STAGES))
+                    .replace("{session_reasons}", "、".join(raw_config.SESSION_REASONS))
+                    .replace("{unified_intents}", "、".join(raw_config.UNIFIED_INTENTS))
+                    .replace(
+                        "{session_emotions}", "、".join(raw_config.SESSION_EMOTIONS)
+                    )
+                    .replace(
+                        "{session_compliance}", "、".join(raw_config.SESSION_COMPLIANCE)
+                    )
+                    .replace(
+                        "{session_outcomes}", "、".join(raw_config.SESSION_OUTCOMES)
+                    )
+                )
+                res = self._call(prompt)
+            except:
+                res = {"ptp": False, "final_outcomes": []}
             res["call_id"] = call["call_id"]
-            self.sess_cache.set(call["call_id"], res)
             return res
-        res = parallel_map(label, calls, self.cfg.llm_max_concurrency, "Session")
-        with open(out_path, "w", encoding="utf-8") as f:
-            for r in res:
-                if r: f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        return res
 
-    def run_pairs(self, calls, out_path):
+        results = parallel_map(
+            label, calls, get_settings().llm_max_concurrency, "Session打标"
+        )
+
+        # === 补回：保存 Session Labels 到 output ===
+        out_file = get_settings().session_labels_file
+        with open(out_file, "w", encoding="utf-8") as f:
+            for r in results:
+                if r:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        log.info(f"✅ Session Labels 已保存至 {out_file}")
+
+        return results
+
+    def run_pairs(self, calls):
         log.info(f"Pair 打标与重写: {len(calls)} 通")
         tasks = []
         for c in calls:
@@ -142,160 +185,252 @@ class LLMLabeler:
             for p in pair_turns(turns):
                 chunk = f"客户: {p['question']}\n催收员: {p['answer']}"
                 # sess 只保留当前 chunk 之前的对话内容
-                prev_turns = turns[:p["q_idx"]]
+                prev_turns = turns[: min(p["q_idx"])]
                 sess_text = self._fmt(prev_turns) if prev_turns else ""
-                tasks.append({
-                    "call_id": c["call_id"],
-                    "q_idx": p["q_idx"],
-                    "a_idx": p["a_idx"],
-                    "sess": sess_text,
-                    "chunk": chunk,
-                })
+                tasks.append(
+                    {
+                        "cid": c["call_id"],
+                        "q_idx": min(p["q_idx"]) if p["q_idx"] else 0,
+                        "a_idx": min(p["a_idx"]) if p["a_idx"] else 0,
+                        "sess": sess_text,
+                        "chunk": chunk,
+                        "q": p["question"],
+                        "a": p["answer"],
+                    }
+                )
 
         def label(t):
-            key = f"{t['call_id']}_{t['q_idx']}"
-            if (c := self.pair_cache.get(key)): return c
-            prompt = (self.prompts.get_pair()
-                    .replace("{session_content}", t["sess"])
-                    .replace("{chunk_content}", t["chunk"]))
             try:
+                prompt = (
+                    self.prompts["pair_prompt"]
+                    .replace("{session_content}", t["sess"])
+                    .replace("{chunk_content}", t["chunk"])
+                    .replace("{sop_stages}", "、".join(raw_config.SOP_STAGES))
+                    .replace("{unified_intents}", "、".join(raw_config.UNIFIED_INTENTS))
+                    .replace(
+                        "{pair_risk_levels}", "、".join(raw_config.PAIR_RISK_LEVELS)
+                    )
+                    .replace("{pair_risk_types}", "、".join(raw_config.PAIR_RISK_TYPES))
+                    .replace("{pair_keywords}", "、".join(raw_config.PAIR_KEYWORDS))
+                )
                 res = self._call(prompt)
-            except Exception as e:
-                log.error(f"Pair 打标失败 {key}: {e}")
-                q_line, a_line = t["chunk"].split("\n")
+            except:
                 res = {
                     "stage": raw_config.SOP_STAGES[0],
                     "customer_intents": ["其他"],
-                    "customer_emotions": [], "agent_actions": [], "keywords": [],
-                    "tags": [], "risk": "None",
-                    "rewritten_question": q_line.replace("客户: ", ""),
-                    "rewritten_answer": a_line.replace("催收员: ", ""),
+                    "risk": "None",
+                    "rewritten_question": t["q"],
+                    "rewritten_answer": t["a"],
                 }
-            res.update({"call_id": t["call_id"], "q_idx": t["q_idx"], "a_idx": t["a_idx"]})
-            self.pair_cache.set(key, res)
+
+            if res.get("stage") not in raw_config.SOP_STAGES:
+                res["stage"] = raw_config.SOP_STAGES[0]
+
+            intents = res.get("customer_intents", [])
+            valid_intents = [it for it in intents if it in raw_config.UNIFIED_INTENTS]
+            if not valid_intents:
+                valid_intents = ["其他"]
+
+            res["customer_intents"] = list(set(valid_intents))
+            res["primary_intent"] = res["customer_intents"][0]
+
+            rq = res.get("rewritten_question", "").strip()
+            ra = res.get("rewritten_answer", "").strip()
+            if not rq.startswith("客户："):
+                rq = "客户：" + rq.replace("客户:", "").strip()
+            if not ra.startswith("催收员："):
+                ra = "催收员：" + ra.replace("催收员:", "").strip()
+
+            res["rewritten_question"] = rq
+            res["rewritten_answer"] = ra
+            res["call_id"] = t["cid"]
             return res
 
-        res = parallel_map(label, tasks, self.cfg.llm_max_concurrency, "Pair")
-        with open(out_path, "w", encoding="utf-8") as f:
-            for r in res:
+        results = [
+            r
+            for r in parallel_map(
+                label, tasks, get_settings().llm_max_concurrency, "Pair打标"
+            )
+            if r
+        ]
+
+        # === 补回：保存 Pair Labels 到 output ===
+        out_file = get_settings().pair_labels_file
+        with open(out_file, "w", encoding="utf-8") as f:
+            for r in results:
                 if r:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        return res
+        log.info(f"✅ Pair Labels 已保存至 {out_file}")
 
-class BERTopicBuilder:
+        return results
+
+
+class PgvectorWriter:
     def __init__(self):
-        self.cfg = get_settings()
-        self.rcfg = raw_config
-        self.model = SentenceTransformer(self.cfg.embedding_model, device=self.cfg.embedding_device)
-
-    def build_and_export(self, docs: List[str]):
-        log.info("构建 BERTopic 并导出标签向量...")
-        if not docs: return
-        
-        # 使用环境变量初始化 BERTopic 依赖
-        ctfidf = ClassTfidfTransformer(seed_words=["催收", "逾期", "还款"], seed_multiplier=self.cfg.bertopic_seed_multiplier) 
-        umap_m = UMAP(
-            n_neighbors=self.cfg.bertopic_umap_neighbors, 
-            n_components=self.cfg.bertopic_umap_components, 
-            metric="cosine", random_state=42
+        cfg = get_settings()
+        self.model = SentenceTransformer(
+            cfg.embedding_model, device=cfg.embedding_device
         )
-        hdbscan_m = HDBSCAN(
-            min_cluster_size=self.cfg.bertopic_hdbscan_min_size, 
-            metric="euclidean", prediction_data=True
-        )
-        
-        topic_model = BERTopic(
-            embedding_model=self.model, 
-            umap_model=umap_m, 
-            hdbscan_model=hdbscan_m, 
-            ctfidf_model=ctfidf, 
-            zeroshot_topic_list=self.rcfg.SOP_STAGES, 
-            zeroshot_min_similarity=self.cfg.bertopic_zeroshot_similarity,
-            seed_topic_list=self.rcfg.SEED_TOPIC_LIST, 
-            min_topic_size=self.cfg.bertopic_min_topic_size
-        )
-        topic_model.fit_transform(docs)
-        
-        # 导出 Stage 向量 (7 x D)
-        stage_emb = self.model.encode(self.rcfg.SOP_STAGES, normalize_embeddings=True)
-        np.save(self.cfg.stage_emb_file, stage_emb)
-        
-        # 导出 Intent 向量 (N x D)
-        intent_emb = self.model.encode(self.rcfg.UNIFIED_INTENTS, normalize_embeddings=True)
-        np.save(self.cfg.intent_emb_file, intent_emb)
-        with open(self.cfg.intent_labels_file, "w", encoding="utf-8") as f:
-            json.dump(self.rcfg.UNIFIED_INTENTS, f, ensure_ascii=False)
-        log.info("标签嵌入导出完成")
 
-class QAExtractor:
-    def __init__(self, calls, sess_labels, pair_labels):
-        self.call_map = {c["call_id"]: c for c in calls}
-        self.sess_map = {s["call_id"]: s for s in sess_labels if s}
-        self.pair_map = {(p["call_id"], p["q_idx"]): p for p in pair_labels if p}
-        self.cfg = get_settings()
+    def write(self, pairs, sessions):
+        sess_map = {s["call_id"]: s for s in sessions if s}
+        ptp_strict_stages = {raw_config.S.NEGOTIATE, raw_config.S.PTP}
 
-    def extract(self):
-        qa_pairs = []
-        for cid, sess in self.sess_map.items():
-            if not sess.get("ptp"): continue
-            call = self.call_map.get(cid)
-            if not call: continue
-            for p in pair_turns(call["turns"]):
-                pl = self.pair_map.get((cid, p["q_idx"]))
-                if not pl or pl.get("risk") == "High": continue
-                intents = pl.get("customer_intents", [])
-                primary_intent = intents[0] if intents else "其他"
-                
-                qa_pairs.append({
-                    "question": pl.get("rewritten_question", p["question"]),
-                    "answer": pl.get("rewritten_answer", p["answer"]),
-                    "stage": pl.get("stage"),
-                    "intent": primary_intent,
-                    "quality": 0.8
-                })
-        unique_qa = list({q["question"]: q for q in qa_pairs}.values())
-        log.info(f"抽取脱敏 QA 对: {len(qa_pairs)} -> {len(unique_qa)}")
-        return unique_qa
+        valid = []
+        for p in pairs:
+            if not p or p.get("risk") == "High" or not p.get("rewritten_question"):
+                continue
+            sess = sess_map.get(p["call_id"], {})
+            is_ptp = sess.get("ptp", False)
+            if p.get("stage") in ptp_strict_stages and not is_ptp:
+                continue
+            p["session_ptp"] = is_ptp
+            p["session_outcomes"] = sess.get("final_outcomes", [])
+            valid.append(p)
 
-class SOPGraphBuilder:
-    def __init__(self, qa_pairs):
-        self.rcfg = raw_config
-        self.qa_pairs = qa_pairs
+        log.info(f"[入库] 过滤后保留 {len(valid)} 条 Pairs 话术")
 
-    def build(self):
-        nodes = {}
-        for stage in self.rcfg.SOP_STAGES:
-            intents_in_stage = self.rcfg.STAGE_GATED_INTENTS.get(stage, [])
-            stage_data = {}
-            for intent in intents_in_stage:
-                scripts = [q for q in self.qa_pairs if q.get("stage") == stage and q.get("intent") == intent]
-                stage_data[intent] = {"scripts": scripts[:10]}
-            nodes[stage] = {"type": "SOP_Stage", "intents": stage_data}
-            
-        edges = []
-        for (src, intent), targets in self.rcfg.TRANSITION_ADJ.items():
-            for tgt in targets:
-                edges.append({"source": src, "target": tgt, "intent": intent})
-        return {"nodes": nodes, "edges": edges}
+        for i in range(0, len(valid), 500):
+            batch = valid[i : i + 500]
+            texts = [
+                f"[{p['stage']}][{p['primary_intent']}] {p['rewritten_question']}"
+                for p in batch
+            ]
+            embs = self.model.encode(texts, normalize_embeddings=True)
+            data = [
+                (
+                    p["call_id"],
+                    p["stage"],
+                    p["primary_intent"],
+                    json.dumps(p.get("tags", []), ensure_ascii=False),
+                    p.get("risk", "None"),
+                    p["session_ptp"],
+                    json.dumps(p["session_outcomes"], ensure_ascii=False),
+                    p["rewritten_question"],
+                    p["rewritten_answer"],
+                    embs[j],
+                )
+                for j, p in enumerate(batch)
+            ]
 
-class VectorIndexBuilder:
+            log.debug(f"[入库] 批量入库 {len(data)} 条数据")
+            for idx, row in enumerate(data):
+                # row[-1] 是 embedding，日志里跳过
+                log.debug(f"[{idx}] {row[:-1]}")
+
+            conn = get_db_conn()
+            try:
+                with conn.cursor() as cur:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO qa_pairs (call_id, stage, primary_intent, tags, risk, session_ptp, session_outcomes, rewritten_question, rewritten_answer, embedding) VALUES %s
+                    """,
+                        data,
+                    )
+                conn.commit()
+            except Exception as e:
+                log.error(f"入库失败: {e}")
+                conn.rollback()
+            finally:
+                release_db_conn(conn)
+
+
+class GoldenScriptGenerator:
     def __init__(self):
-        self.cfg = get_settings()
-        self.model = SentenceTransformer(self.cfg.embedding_model)
+        cfg = get_settings()
+        self.client = OpenAI(api_key=cfg.llm_api_key, base_url=cfg.llm_base_url)
+        with open(cfg.prompt_file, "r", encoding="utf-8") as f:
+            self.prompts = yaml.safe_load(f)
 
-    def build(self, qa_pairs):
-        if not qa_pairs: return
-        self.cfg.faiss_dir.mkdir(parents=True, exist_ok=True)
-        q_texts = [q["question"] for q in qa_pairs]
-        l_texts = [" ".join([q["intent"]]) for q in qa_pairs]
-        
-        q_emb = self.model.encode(q_texts, batch_size=self.cfg.embedding_batch_size, normalize_embeddings=True, show_progress_bar=True).astype(np.float32)
-        l_emb = self.model.encode(l_texts, batch_size=self.cfg.embedding_batch_size, normalize_embeddings=True, show_progress_bar=True).astype(np.float32)
-        
-        q_idx, l_idx = faiss.IndexFlatIP(q_emb.shape[1]), faiss.IndexFlatIP(l_emb.shape[1])
-        q_idx.add(q_emb); l_idx.add(l_emb)
-        
-        faiss.write_index(q_idx, str(self.cfg.faiss_dir / "question.faiss"))
-        faiss.write_index(l_idx, str(self.cfg.faiss_dir / "label.faiss"))
-        with open(self.cfg.faiss_dir / "qa_meta.json", "w", encoding="utf-8") as f:
-            json.dump(qa_pairs, f, ensure_ascii=False)
+    @retry()
+    def _call(self, prompt):
+        resp = self.client.chat.completions.create(
+            model=get_settings().llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+        log.debug(f"prompt: {prompt}")
+        log.debug(f"response: {resp.choices[0].message.content}")
+        return safe_json_loads(resp.choices[0].message.content)
+
+    def synthesize(self, stage, intent):
+        conn = get_db_conn()
+        mode = None
+        try:
+            with conn.cursor() as cur:
+                # 一级：精确匹配
+                cur.execute(
+                    """
+                    SELECT rewritten_question, rewritten_answer, tags FROM (
+                        SELECT *, ROW_NUMBER() OVER(PARTITION BY tags::text ORDER BY RANDOM()) as rn
+                        FROM qa_pairs WHERE stage=%s AND primary_intent=%s AND risk != 'High'
+                    ) sub WHERE rn <= 3 LIMIT 20
+                """,
+                    (stage, intent),
+                )
+                rows = cur.fetchall()
+                mode = "exact"
+
+                # 二级：阶段模糊匹配
+                if not rows:
+                    log.warning(
+                        f"  ⚠️ [{stage}] 下的 [{intent}] 无专属语料，触发模糊兜底..."
+                    )
+                    cur.execute(
+                        """
+                        SELECT rewritten_question, rewritten_answer, tags FROM (
+                            SELECT *, ROW_NUMBER() OVER(PARTITION BY primary_intent ORDER BY RANDOM()) as rn
+                            FROM qa_pairs WHERE stage=%s AND risk != 'High'
+                        ) sub WHERE rn <= 2 LIMIT 10
+                    """,
+                        (stage,),
+                    )
+                    rows = cur.fetchall()
+                    mode = "fuzzy"
+
+                # # 三级：全库随机兜底
+                # if not rows:
+                #     log.error(f"  🚨 [{stage}] 整个阶段完全无数据！触发全库随机兜底...")
+                #     cur.execute("""
+                #         SELECT rewritten_question, rewritten_answer, tags FROM qa_pairs
+                #         WHERE risk = 'None' ORDER BY RANDOM() LIMIT 5
+                #     """)
+                #     rows = cur.fetchall()
+                #     mode = "random"
+
+        finally:
+            release_db_conn(conn)
+
+        if not rows:
+            return mode, []
+
+        samples = "\n".join(
+            [f"- 客户: {r[0]}\n  坐席: {r[1]}\n  标签: {r[2]}" for r in rows]
+        )
+
+        try:
+            res = self._call(
+                self.prompts["golden_script_prompt"]
+                .replace("{stage}", stage)
+                .replace("{intent}", intent)
+                .replace("{samples}", samples)
+            )
+            return mode, res.get("golden_qa_pairs", [])
+        except:
+            return mode, []
+
+    def build_graph(self):
+        graph = {"nodes": {}, "edges": []}
+        for stage, intents in raw_config.SOP_FLOW.items():
+            node = {}
+            for intent in intents:
+                mode, data = self.synthesize(stage, intent)
+                node[intent] = {"mode": mode, "golden_qa_pairs": data} if data else None
+            graph["nodes"][stage] = {"intents": node}
+        for (src, intent), tgt in raw_config.SOP_TRANSITIONS.items():
+            graph["edges"].append(
+                {"source": src, "target": tgt, "trigger_intent": intent}
+            )
+        return graph

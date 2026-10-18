@@ -25,5 +25,12 @@ networkx==3.4.2
 umap-learn>=0.5.0
 hdbscan>=0.8.0
 jieba>=0.42.1
-pydantic-settings>=2.0.0
+
 rapidfuzz>=3.0.0
+psycopg2-binary>=2.9.9
+pgvector>=0.2.4
+redis>=5.0.0
+pydantic-settings>=2.0.0
+pgserver>=0.1.4
+fakeredis>=2.22.0
+
