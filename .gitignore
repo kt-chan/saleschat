@@ -45,7 +45,6 @@ htmlcov/
 .ipynb_checkpoints/
 
 # ---------- IDE / OS ----------
-!.vscode/
 .idea/
 *.swp
 .DS_Store
@@ -53,9 +52,15 @@ Thumbs.db
 
 # ---------- Logs / local data ----------
 log/
-output/
+*.log
+*.sqlite3
+db.sqlite3  
 tmp/
 cache/ 
 *.log
 *.sqlite3
 db.sqlite3
+
+# ---- must keep ---
+!.vscode/
+!output/
