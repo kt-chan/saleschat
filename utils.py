@@ -1,13 +1,14 @@
 import json, time, re, functools, os, shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, List, Any, Optional, Dict
+from typing import Callable, List, Any, Optional, Dict, Tuple
 from tqdm import tqdm
 import psycopg2
 from psycopg2 import pool as pg_pool
 from pgvector.psycopg2 import register_vector
 import redis
 import fakeredis
+from sentence_transformers import SentenceTransformer
 
 from logger import get_logger
 from settings import get_settings
@@ -15,7 +16,10 @@ from settings import get_settings
 log = get_logger(__name__)
 _db_pool = None
 _embedded_pg_server = None
+_embedder: Optional[SentenceTransformer] = None
 
+
+# ---------------- JSON ----------------
 
 def safe_json_loads(text: str) -> dict:
     if not text:
@@ -27,16 +31,18 @@ def safe_json_loads(text: str) -> dict:
         if match:
             try:
                 return json.loads(match.group(1))
-            except:
+            except Exception:
                 pass
         match = re.search(r"(\{.*\})", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(1))
-            except:
+            except Exception:
                 pass
     return {}
 
+
+# ---------------- DB ----------------
 
 def get_db_pool():
     global _db_pool, _embedded_pg_server
@@ -45,29 +51,20 @@ def get_db_pool():
         if cfg.use_embedded_db:
             try:
                 import pgserver
-
                 pg_data_dir = str(Path(cfg.cache_dir) / "local_pgdata")
                 os.makedirs(pg_data_dir, exist_ok=True)
-                _embedded_pg_server = pgserver.get_server(
-                    pg_data_dir, cleanup_mode="stop"
-                )
+                _embedded_pg_server = pgserver.get_server(pg_data_dir, cleanup_mode="stop")
                 dsn = _embedded_pg_server.get_uri()
-                _db_pool = pg_pool.ThreadedConnectionPool(
-                    cfg.db_pool_min, cfg.db_pool_max, dsn=dsn
-                )
+                _db_pool = pg_pool.ThreadedConnectionPool(cfg.db_pool_min, cfg.db_pool_max, dsn=dsn)
                 log.info("本地嵌入式 PostgreSQL 启动成功")
             except Exception as e:
                 log.error(f"本地数据库启动失败: {e}")
-                raise e
+                raise
         else:
             _db_pool = pg_pool.ThreadedConnectionPool(
-                cfg.db_pool_min,
-                cfg.db_pool_max,
-                host=cfg.db_host,
-                port=cfg.db_port,
-                dbname=cfg.db_name,
-                user=cfg.db_user,
-                password=cfg.db_password,
+                cfg.db_pool_min, cfg.db_pool_max,
+                host=cfg.db_host, port=cfg.db_port, dbname=cfg.db_name,
+                user=cfg.db_user, password=cfg.db_password,
             )
             log.info("远程 Pgvector ThreadedConnectionPool 初始化完成")
     return _db_pool
@@ -85,7 +82,7 @@ def get_db_conn():
             register_vector(conn)
         except psycopg2.ProgrammingError as e:
             if "vector type not found" not in str(e):
-                raise e
+                raise
         return conn
     except Exception as e:
         log.warning(f"数据库连接心跳异常，正在尝试重连: {e}")
@@ -93,7 +90,7 @@ def get_db_conn():
         conn = _db_pool.getconn()
         try:
             register_vector(conn)
-        except:
+        except Exception:
             pass
         return conn
 
@@ -141,11 +138,12 @@ def init_db():
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
         conn.commit()
-
         register_vector(conn)
 
+        dim = get_embedder().get_sentence_embedding_dimension()
+
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS qa_pairs (
                     id SERIAL PRIMARY KEY,
                     call_id VARCHAR(64),
@@ -157,33 +155,48 @@ def init_db():
                     session_outcomes JSONB,
                     rewritten_question TEXT NOT NULL,
                     rewritten_answer TEXT NOT NULL,
-                    embedding vector(768),
+                    embedding vector({dim}),
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
             cur.execute(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='qa_pairs' AND column_name='session_ptp');"
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='qa_pairs' AND column_name='session_ptp');"
             )
             if not cur.fetchone()[0]:
                 cur.execute("ALTER TABLE qa_pairs ADD COLUMN session_ptp BOOLEAN;")
 
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_qa_emb ON qa_pairs USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);"
+                "CREATE INDEX IF NOT EXISTS idx_qa_emb ON qa_pairs "
+                "USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);"
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_qa_stage_intent ON qa_pairs (stage, primary_intent);"
             )
         conn.commit()
-        log.info("数据库平滑升级检查完成")
+        log.info(f"数据库平滑升级检查完成 (embedding dim={dim})")
     finally:
         release_db_conn(conn)
 
+
+# ---------------- Embedder ----------------
+
+def get_embedder() -> SentenceTransformer:
+    global _embedder
+    if _embedder is None:
+        cfg = get_settings()
+        log.info(f"Loading embedding model: {cfg.embedding_model} on {cfg.embedding_device}")
+        _embedder = SentenceTransformer(cfg.embedding_model, device=cfg.embedding_device)
+    return _embedder
+
+
+# ---------------- Session store (retained for optional streaming use) ----------------
 
 class SessionStore:
     def __init__(self):
         cfg = get_settings()
         self.ttl = cfg.session_ttl
-        self.memory = {}
+        self.memory: Dict[str, dict] = {}
         self.use_redis = False
         self.use_fake_redis = False
 
@@ -206,17 +219,17 @@ class SessionStore:
     def get(self, sid: str) -> dict:
         if self.use_fake_redis or self.use_redis:
             data = self.r.get(f"session:{sid}")
-            return json.loads(data) if data else {"stage": "", "history": []}
-        return self.memory.get(sid, {"stage": "", "history": []})
+            return json.loads(data) if data else {"stage": "", "history": [], "trace": []}
+        return self.memory.get(sid, {"stage": "", "history": [], "trace": []})
 
     def set(self, sid: str, state: dict):
         if self.use_fake_redis or self.use_redis:
-            self.r.setex(
-                f"session:{sid}", self.ttl, json.dumps(state, ensure_ascii=False)
-            )
+            self.r.setex(f"session:{sid}", self.ttl, json.dumps(state, ensure_ascii=False))
         else:
             self.memory[sid] = state
 
+
+# ---------------- Concurrency ----------------
 
 def retry(max_retries: int = 3, backoff: float = 2.0):
     def decorator(func):
@@ -225,19 +238,15 @@ def retry(max_retries: int = 3, backoff: float = 2.0):
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
-                except Exception as e:
+                except Exception:
                     if attempt == max_retries - 1:
-                        raise e
-                    time.sleep(backoff**attempt)
-
+                        raise
+                    time.sleep(backoff ** attempt)
         return wrapper
-
     return decorator
 
 
-def parallel_map(
-    func: Callable, items: List[Any], max_workers: int = 8, desc: str = "Processing"
-) -> List[Any]:
+def parallel_map(func: Callable, items: List[Any], max_workers: int = 8, desc: str = "Processing") -> List[Any]:
     if not items:
         return []
     results = [None] * len(items)
@@ -253,3 +262,114 @@ def parallel_map(
                 finally:
                     pbar.update(1)
     return results
+
+
+# ---------------- Dialog parsing ----------------
+
+def _build_dialog_patterns(cfg) -> Tuple[re.Pattern, str]:
+    role_pattern = "|".join(re.escape(r) for r in cfg.dialog_role_prefixes)
+    turn_re = re.compile(rf"^({role_pattern}){cfg.dialog_colon_pattern}(.*)$")
+    sep_class = "[" + "".join(re.escape(s) for s in cfg.dialog_turn_separators) + "]"
+    return turn_re, sep_class
+
+
+def _auto_detect_mode(text: str, cfg) -> str:
+    if cfg.dialog_parse_mode != "auto":
+        return cfg.dialog_parse_mode
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return "separator"
+    turn_re, _ = _build_dialog_patterns(cfg)
+    matching = sum(1 for l in lines if turn_re.match(l))
+    return "line" if matching >= len(lines) * 0.8 else "separator"
+
+
+def _parse_separator(text: str, cfg) -> List[Dict]:
+    turn_re, sep_class = _build_dialog_patterns(cfg)
+    turns, turn_id = [], 0
+    for part in re.split(sep_class, text):
+        part = part.strip()
+        if not part:
+            continue
+        m = turn_re.match(part)
+        if not m:
+            continue
+        role = cfg.dialog_role_aliases.get(m.group(1), m.group(1))
+        content = m.group(2).strip()
+        if content:
+            turns.append({"turn_id": turn_id, "role": role, "text": content})
+            turn_id += 1
+    return turns
+
+
+def _parse_line(text: str, cfg) -> List[Dict]:
+    turn_re, _ = _build_dialog_patterns(cfg)
+    turns, turn_id = [], 0
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = turn_re.match(line)
+        if m:
+            role = cfg.dialog_role_aliases.get(m.group(1), m.group(1))
+            content = m.group(2).strip()
+            if content:
+                turns.append({"turn_id": turn_id, "role": role, "text": content})
+                turn_id += 1
+        elif turns:
+            turns[-1]["text"] += " " + line
+    return turns
+
+
+def parse_dialog(text: str, mode: Optional[str] = None, cfg=None) -> List[Dict]:
+    cfg = cfg or get_settings()
+    if not text:
+        return []
+    effective = mode or _auto_detect_mode(text, cfg)
+    if effective == "line":
+        return _parse_line(text, cfg)
+    return _parse_separator(text, cfg)
+
+
+def format_turns(turns: List[Dict], sep: str = ": ") -> str:
+    return "\n".join([f"{t['role']}{sep}{t['text']}" for t in turns])
+
+
+def merge_consecutive(turns: List[Dict], sep: str = "") -> List[Dict]:
+    blocks: List[Dict] = []
+    for idx, t in enumerate(turns):
+        if blocks and blocks[-1]["role"] == t["role"]:
+            blocks[-1]["text"] += sep + t["text"]
+            blocks[-1]["end_idx"] = idx
+        else:
+            blocks.append({"role": t["role"], "text": t["text"], "start_idx": idx, "end_idx": idx})
+    return blocks
+
+
+def pair_turns(turns: List[Dict], sep: str = "", customer_role: Optional[str] = None) -> List[Dict]:
+    cfg = get_settings()
+    customer_role = customer_role or cfg.dialog_customer_role
+    blocks = merge_consecutive(turns, sep=sep)
+    pairs: List[Dict] = []
+    i = 0
+    while i < len(blocks):
+        b = blocks[i]
+        if b["role"] != customer_role:
+            i += 1
+            continue
+        if i + 1 < len(blocks) and blocks[i + 1]["role"] != customer_role:
+            a = blocks[i + 1]
+            pairs.append({
+                "q_idx": (b["start_idx"], b["end_idx"]),
+                "a_idx": (a["start_idx"], a["end_idx"]),
+                "question": b["text"], "answer": a["text"],
+            })
+            i += 2
+        else:
+            pairs.append({
+                "q_idx": (b["start_idx"], b["end_idx"]),
+                "a_idx": None, "question": b["text"], "answer": None,
+            })
+            i += 1
+    return pairs
+

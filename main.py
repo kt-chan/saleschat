@@ -1,17 +1,42 @@
-import json, shutil, argparse
+import json, time, argparse
+from pathlib import Path
+from typing import Optional
+
 from settings import get_settings
 from logger import get_logger
-from utils import init_db, clear_system_data
+from utils import init_db, clear_system_data, parse_dialog
 from offline import load_calls, LLMLabeler, PgvectorWriter, GoldenScriptGenerator
-from online import RealtimeRecommender
-import config as raw_config
+from online import HybridRetriever, get_retriever, suggest_script_for_conversation
 
 log = get_logger(__name__)
+retriever: Optional[HybridRetriever] = None
+
+
+_DEFAULT_DEMO_TEXT = (
+    "催收员：您好，请问是张先生吗？\n"
+    "客户：是我。\n"
+    "催收员：您名下信用卡本期逾期1900元，请问能处理吗？\n"
+    "客户：我最近被裁员了，暂时没有收入。\n"
+    "坐席：理解您的困难。那能不能找朋友先凑一下呢？\n"
+    "客户：朋友也不宽裕。你们刚说可以延期几天并减免违约金，后天我也不敢保证能借到。\n"
+    "坐席：那我们先登记诉求，后续再回访确认，可以吗？\n"
+    "客户：可以的。"
+)
+
+
+def _load_demo_text() -> str:
+    cfg = get_settings()
+    if cfg.demo_text:
+        return cfg.demo_text
+    p = Path(cfg.demo_text_file)
+    if p.exists():
+        return p.read_text(encoding="utf-8")
+    log.warning(f"Demo 文本文件不存在 ({p})，使用内置默认示例")
+    return _DEFAULT_DEMO_TEXT
 
 
 def offline_pipeline():
     cfg = get_settings()
-
     if cfg.clear_cache_on_start:
         clear_system_data()
 
@@ -25,7 +50,7 @@ def offline_pipeline():
     log.info("=== 阶段2: LLM 双级打标 (自动落盘) ===")
     labeler = LLMLabeler()
     sessions = labeler.run_sessions(calls)
-    pairs = labeler.run_pairs(calls)
+    pairs = labeler.run_pairs(calls, sessions)
 
     log.info("=== 阶段3: 向量化入库 ===")
     PgvectorWriter().write(pairs, sessions)
@@ -35,54 +60,78 @@ def offline_pipeline():
     with open(cfg.sop_graph_file, "w", encoding="utf-8") as f:
         json.dump(graph, f, ensure_ascii=False, indent=2)
     log.info(f"✅ SOP 图谱已保存至 {cfg.sop_graph_file}")
-
     log.info("🎉 离线流程全部完成")
 
 
-def online_demo():
-    log.info("=== 在线实时推理测试 (多轮合并 & 配置控制状态机) ===")
-    rec = RealtimeRecommender()
+def setup_retriever():
+    global retriever
 
-    # 客户：
-    testquestion = "催收员告知可申请延期3天处理剩余1900元相关金额并申请减免违约金）后天？后天我也不敢保证能借到。"
-    dialog = [
-        ("坐席", "您好，请问是张先生吗？"),
-        ("客户", "是我。"),
-        ("坐席", "您名下信用卡本期逾期1900元，请问能处理吗？"),
-        ("客户", "我最近被裁员了，没钱。"),
-        ("坐席", "理解。那能不能找朋友凑一下？"),
-        ("客户", testquestion),
-    ]
+    if retriever is None:
+        try:
+            retriever = get_retriever()
+        except FileNotFoundError as e:
+            log.error(str(e))
+            return
 
-    print("\n--- 历史会话过程 ---")
-    for role, text in dialog:
-        print(f"[{role}] {text}")
 
-    # 提取客户的每一句话，合并成一个大 Query
-    customer_statements = [f"{role}:{text}" for role, text in dialog]
-    merged_query = " ".join(customer_statements)
+def online_pipeline(text, label, hint):
+    log.info("=== suggest_script_for_conversation Demo ===")
+    setup_retriever()
 
-    print(f"\n🔍 触发多轮合并一次查询: {merged_query}")
+    print("\n" + "=" * 72)
+    print(f"🔎 {label}")
+    print("=" * 72)
 
-    sid = "demo_session"
-    # 初始化会话状态为起点
-    rec.store.set(sid, {"stage": raw_config.SOP_STAGES[0], "history": []})
+    t0 = time.time()
+    res = suggest_script_for_conversation(text, stage_hint=hint)
+    wall = (time.time() - t0) * 1000
 
-    # 把合并后的客户发言，作为单次客户输入丢给 on_asr
-    res = rec.on_asr(sid, "客户", merged_query)
+    if res["reject"]:
+        print(f"  🚫 reject={res['reject_reason']}")
+        print(f"  💬 Fallback: {res['script']}")
+        print(f"  ⏱  {wall:.1f}ms")
+        if res.get("debug"):
+            print(f"  🔍 debug: {res['debug']}")
+        return
 
-    if res:
+    d = res.get("debug") or {}
+    print(f"  📍 Stage:    {res['stage']}")
+    print(f"  📍 Intent:   {res['intent']}")
+    print(f"  📍 Source:   {res['source']} (score={res['score']})")
+    print(f"  📍 Path:     {d.get('path')} | passes={d.get('passes')}")
+    if d.get("stage_vote_1"):
         print(
-            f"\n👉 最终命中阶段: {res['stage']} | 意图: {res['intent']} | 耗时: {res['latency_ms']}ms"
+            f"  📍 Pass 1:   stage={d.get('stage_vote_1')} intent={d.get('intent_vote_1')}"
         )
-        if res.get("reject"):
-            print(f"  🚫 拒答原因: {res['reject_reason']}")
-        elif res["recs"]:
-            print(f"  🏆 推荐经典 Q&A:")
-            print(f"     Q: {res['recs'][0]['question']}")
-            print(f"     A: {res['recs'][0]['answer']}")
-        elif res["fallback"]:
-            print(f"  ⚠️ 兜底话术: {res['fallback'][0]['answer']}")
+    print(f"\n  💬 Script for 催收员:")
+    print(f"     {res['script']}")
+    if res["question"]:
+        print(f"\n  ❓ Reference Q:")
+        print(f"     {res['question']}")
+    if res["alternates"]:
+        print(f"\n  🔄 Alternates ({len(res['alternates'])}):")
+        for i, alt in enumerate(res["alternates"][:3], 1):
+            print(f"     [{i}] {alt['answer']}")
+            print(f"         (source={alt['source']} score={alt['score']})")
+    print(f"\n  ⏱  {wall:.1f}ms")
+
+
+def online_demo():
+
+    text = _load_demo_text()
+    turns = parse_dialog(text)
+
+    print("\n" + "=" * 72)
+    print("📞 Input conversation (from call-center detector):")
+    print("=" * 72)
+    for t in turns:
+        print(f"  [{t['turn_id']:>2}] {t['role']}: {t['text']}")
+
+    for label, hint in [
+        ("Fast path (stage_hint='04 方案协商与签署')", "04 方案协商与签署"),
+        ("Slow path (no hint — infer from conversation)", None),
+    ]:
+        online_pipeline(text, label, hint)
 
 
 if __name__ == "__main__":
