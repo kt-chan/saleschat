@@ -28,19 +28,17 @@ COPY requirements.txt .
 RUN case "${TARGETARCH}" in \
         amd64) \
             pip install --no-cache-dir \
-                torch==2.6.0 \
-                torchvision==0.21.0 \
-                torchaudio==2.6.0 \
+                torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
                 --index-url https://download.pytorch.org/whl/cu124 ;; \
         arm64) \
+            # arm64 直接使用默认 PyPI 源（官方在 PyPI 上维护了 arm64 CPU 版本的 wheel）
             pip install --no-cache-dir \
-                torch==2.6.0 \
-                torchvision==0.21.0 \
-                torchaudio==2.6.0 \
-                --index-url https://download.pytorch.org/whl/cpu ;; \
+                torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 ;; \
         *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && pip install --no-cache-dir -r requirements.txt
+
+
 
 COPY . .
 
