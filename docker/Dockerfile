@@ -1,36 +1,47 @@
-# docker/Dockerfile
+# syntax=docker/dockerfile:1.7
 FROM python:3.12-slim
 
-# 设置环境变量，确保 Python 输出不被缓冲，且不生成 .pyc 文件
+# BuildKit 在多架构构建时自动注入：amd64 或 arm64
+ARG TARGETARCH
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    # 指定 HuggingFace 缓存目录，方便挂载持久化
     HF_HOME=/app/cache/huggingface \
-    TORCH_HOME=/app/cache/torch
+    TORCH_HOME=/app/cache/torch \
+    TOKENIZERS_PARALLELISM=false
 
 WORKDIR /app
 
-# 安装系统底层依赖 (psycopg2 编译需要, sentence-transformers 可能依赖)
+# 系统依赖：两种架构下 Debian 仓库均提供对应二进制
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
-    wget curl vim \
-    iputils-ping net-tools\
+    wget curl \
+    vim iputils-ping net-tools \
     && rm -rf /var/lib/apt/lists/*
 
-# 先复制 requirements.txt 并安装依赖，利用 Docker 镜像层缓存
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制项目代码
+# 显式按架构安装 PyTorch CPU 版本
+# 注意：请将 torch / torchvision / torchaudio 从 requirements.txt 中移除，
+# 避免重复安装或版本冲突
+RUN case "${TARGETARCH}" in \
+        amd64|arm64) \
+            pip install --no-cache-dir \
+                torch==2.6.0 \
+                torchvision==0.21.0 \
+                torchaudio==2.6.0 \
+                --index-url https://download.pytorch.org/whl/cu124 ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && pip install --no-cache-dir -r requirements.txt
+
 COPY . .
 
-# 兜底删除（尽管 .dockerignore 已经拦截了，但为了绝对安全）
+# 兜底清理，防止敏感文件或运行时数据被打入镜像
 RUN rm -f .env .env.* && \
     rm -rf data output log cache
 
-# 暴露端口 (如果你的项目未来封装了 FastAPI 接口，可在此处开放)
 EXPOSE 8000
 
-# 默认启动命令：执行离线构建 (可通过 docker-compose 覆盖为 --mode online)
-CMD ["python", "-m", "app.main", "--mode", "offline"]
+CMD ["python", "main.py", "--mode", "offline"]
