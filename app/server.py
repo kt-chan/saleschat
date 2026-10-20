@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
 
-from online import suggest_script_for_conversation, get_retriever
+from app.online import suggest_script_for_conversation, get_retriever
 
 app = FastAPI(title="催收话术推荐")
 

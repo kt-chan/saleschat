@@ -3,10 +3,10 @@ from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 import numpy as np
 import re
-import config as raw_config
-from settings import Settings, get_settings
-from logger import get_logger
-from utils import get_db_conn, release_db_conn, get_embedder, parse_dialog
+import app.config as raw_config
+from app.settings import Settings, get_settings
+from app.logger import get_logger
+from app.utils import get_db_conn, release_db_conn, get_embedder, parse_dialog
 
 _MIN_CUSTOMER_ROUNDS = 3  # 硬编码：目标窗口 = 最后 3 条客户话术
 _SENT_END_RE = re.compile(r"[。！？；;!?\n]")
@@ -274,13 +274,27 @@ class HybridRetriever:
         if not merged:
             return None, None
         top_n = self.cfg.hybrid_vote_top_n
-        s_score, i_score = defaultdict(float), defaultdict(float)
-        for m in merged[:top_n]:
+        recent = merged[:top_n]
+
+        # 先定 stage
+        s_score: Dict[str, float] = defaultdict(float)
+        for m in recent:
             s_score[m["stage"]] += m["score"] ** 2
-            i_score[m["intent"]] += m["score"] ** 2
         if not s_score:
             return None, None
-        return max(s_score, key=s_score.get), max(i_score, key=i_score.get)
+        voted_stage = max(s_score, key=s_score.get)
+
+        # 再在该 stage 内投 intent
+        i_score: Dict[str, float] = defaultdict(float)
+        for m in recent:
+            if m["stage"] == voted_stage:
+                i_score[m["intent"]] += m["score"] ** 2
+        if not i_score:
+            voted_intent = raw_config.SOP_FLOW[voted_stage][0]
+        else:
+            voted_intent = max(i_score, key=i_score.get)
+
+        return voted_stage, voted_intent
 
     def _format(
         self,
@@ -308,6 +322,7 @@ class HybridRetriever:
                     "question": r["question"],
                     "answer": r["answer"],
                     "score": round(r["score"], 4),
+                    "raw_sim": round(r["raw_sim"], 4), 
                     "source": r["source"],
                 }
                 for r in recs
@@ -317,6 +332,7 @@ class HybridRetriever:
                     "question": r["question"],
                     "answer": r["answer"],
                     "score": round(r["score"], 4),
+                    "raw_sim": round(r["raw_sim"], 4), 
                     "source": r["source"],
                 }
                 for r in fallback
@@ -535,20 +551,22 @@ class HybridRetriever:
 # ============================================================
 #  Singleton
 # ============================================================
+import threading
 
+_retriever_lock = threading.Lock()
 _retriever: Optional[HybridRetriever] = None
 
 
 def get_retriever() -> HybridRetriever:
     global _retriever
-    if _retriever is None:
-        path = get_settings().sop_graph_file
-        if not path.exists():
-            raise FileNotFoundError(
-                f"SOP graph not found at {path}. "
-                f"Run `python main.py --mode offline` first to build it."
-            )
-        _retriever = HybridRetriever(str(path))
+    if _retriever is not None:
+        return _retriever
+    with _retriever_lock:
+        if _retriever is None:
+            path = get_settings().sop_graph_file
+            if not path.exists():
+                raise FileNotFoundError(...)
+            _retriever = HybridRetriever(str(path))
     return _retriever
 
 

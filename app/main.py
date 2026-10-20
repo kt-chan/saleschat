@@ -2,11 +2,11 @@ import json, time, argparse
 from pathlib import Path
 from typing import Optional
 
-from settings import get_settings
-from logger import get_logger
-from utils import init_db, clear_system_data, parse_dialog
-from offline import load_calls, LLMLabeler, PgvectorWriter, GoldenScriptGenerator
-from online import HybridRetriever, get_retriever, suggest_script_for_conversation
+from app.settings import get_settings
+from app.logger import get_logger
+from app.utils import init_db, clear_system_data, parse_dialog
+from app.offline import load_calls, LLMLabeler, PgvectorWriter, GoldenScriptGenerator
+from app.online import HybridRetriever, get_retriever, suggest_script_for_conversation
 
 log = get_logger(__name__)
 retriever: Optional[HybridRetriever] = None

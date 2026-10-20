@@ -4,14 +4,14 @@ from typing import List, Dict, Optional
 
 from psycopg2.extras import execute_values
 
-import config as raw_config
-from settings import get_settings
-from logger import get_logger
-from utils import (
+import app.config as raw_config
+from app.settings import get_settings
+from app.logger import get_logger
+from app.utils import (
     parallel_map, get_db_conn, release_db_conn, get_embedder,
     parse_dialog, format_turns, pair_turns,
 )
-from llm import LLMClient, get_llm_client
+from app.llm import LLMClient, get_llm_client
 
 log = get_logger(__name__)
 

@@ -1,6 +1,6 @@
 import sys
 from loguru import logger
-from settings import get_settings
+from app.settings import get_settings
 
 
 def setup_logger():

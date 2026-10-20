@@ -3,9 +3,9 @@ from typing import Dict, Optional
 
 from openai import OpenAI
 
-from settings import get_settings
-from logger import get_logger
-from utils import safe_json_loads
+from app.settings import get_settings
+from app.logger import get_logger
+from app.utils import safe_json_loads
 
 log = get_logger(__name__)
 

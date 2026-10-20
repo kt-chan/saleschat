@@ -1,0 +1,76 @@
+# docker/docker-compose.yml
+version: '3.8'
+
+services:
+  # 1. 向量数据库 (带 pgvector 扩展)
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: cca_pgvector
+    environment:
+      POSTGRES_USER: cca_user
+      POSTGRES_PASSWORD: cca_pass
+      POSTGRES_DB: cca_db
+      TZ: Asia/Hong_Kong
+    ports:
+      - "5432:5432"
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cca_user -d cca_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. Redis 缓存 (用于 Session 状态持久化)
+  redis:
+    image: redis:7-alpine
+    container_name: cca_redis
+    environment:
+      TZ: Asia/Hong_Kong
+    ports:
+      - "6379:6379"
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # 3. 应用服务 (离线/在线)
+  saleschat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: cca_saleschat
+    environment:
+      TZ: Asia/Hong_Kong
+    env_file:
+      - ../.env
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      # 挂载数据、日志、输出和模型缓存目录，防止数据丢失
+      - ../.env:/app/.env:ro
+      - ../data:/app/data
+      - ../output:/app/output
+      - ../log:/app/log
+      - ../cache:/app/cache
+      - ../testllm.py:/app/testllm.py
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 默认执行离线构建；如果要跑在线测试，使用：
+    # command: ["tail", "-f", "/dev/null"]
+    command: ["python", "-m", "app.main", "--mode", "offline"]
+
+volumes:
+  pgdata:
+  redisdata:
+  model_cache:

@@ -10,8 +10,8 @@ import redis
 import fakeredis
 from sentence_transformers import SentenceTransformer
 
-from logger import get_logger
-from settings import get_settings
+from app.logger import get_logger
+from app.settings import get_settings
 
 log = get_logger(__name__)
 _db_pool = None

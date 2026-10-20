@@ -1,0 +1,37 @@
+# .dockerignore
+
+# ==================== 敏感配置与环境变量 ====================
+# 忽略所有本地环境变量文件
+.env
+.env.*
+!.env.example
+
+# ==================== 本地运行数据与缓存 ====================
+# 忽略本地生成的文件，避免打进镜像导致镜像臃肿或数据污染
+data/
+output/
+log/
+cache/
+local_pgdata/
+
+# ==================== Python 运行时产物 ====================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ==================== Git 与 IDE 相关 ====================
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# ==================== Docker 自身文件 ====================
+# 避免把 docker 目录再次打包进镜像的 /app 目录
+docker/
+docker-compose.yml
+docker-compose.*.yml
+Dockerfile
