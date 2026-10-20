@@ -26,12 +26,18 @@ COPY requirements.txt .
 # 注意：请将 torch / torchvision / torchaudio 从 requirements.txt 中移除，
 # 避免重复安装或版本冲突
 RUN case "${TARGETARCH}" in \
-        amd64|arm64) \
+        amd64) \
             pip install --no-cache-dir \
                 torch==2.6.0 \
                 torchvision==0.21.0 \
                 torchaudio==2.6.0 \
                 --index-url https://download.pytorch.org/whl/cu124 ;; \
+        arm64) \
+            pip install --no-cache-dir \
+                torch==2.6.0 \
+                torchvision==0.21.0 \
+                torchaudio==2.6.0 \
+                --index-url https://download.pytorch.org/whl/cpu ;; \
         *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && pip install --no-cache-dir -r requirements.txt
