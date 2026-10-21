@@ -11,6 +11,13 @@ on:
 env:
   REGISTRY: ghcr.io
 
+# 显式声明 GITHUB_TOKEN 权限：
+#   contents: read  → checkout 代码
+#   packages: write → 推送镜像与 manifest 到 GHCR
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   # ==========================================================
   # 1) 每个架构在各自的原生 Runner 上并行构建 + push-by-digest
@@ -52,7 +59,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ✅ outputs 必须是单行：逗号分隔的 key=value
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
@@ -61,7 +67,8 @@ jobs:
           file: ./docker/Dockerfile
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # push-by-digest 要求 name 中必须带显式 tag，否则报 "tag is needed when pushing to registry"
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest,push-by-digest=true,name-canonical=true,push=true
           secrets: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
           cache-from: type=gha,scope=${{ matrix.target }}-v3
@@ -135,9 +142,12 @@ jobs:
       - name: Create and push multi-arch manifest
         working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          # DOCKER_METADATA_OUTPUT_JSON 由 metadata-action 注入，供后续 step 使用
+          TAG_ARGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          SOURCE_ARGS=$(for f in *; do echo -n "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:$f "; done)
+          echo "Tags: $TAG_ARGS"
+          echo "Sources: $SOURCE_ARGS"
+          docker buildx imagetools create $TAG_ARGS $SOURCE_ARGS
 
       - name: Verify multi-arch manifest
         run: |
