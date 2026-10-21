@@ -6,13 +6,13 @@
 #
 # 两个 target 都安装了 GPU/NPU 运行时；如果运行环境无卡，应用会回退 CPU。
 # 构建期 smoke test 只验证「软件栈完整 + 无卡回退 CPU + CPU 推理」，不做真实加速器推理。
-# 真实加速器验证请用 scripts/verify_accel.py（见仓库）。
 
 ARG PYTHON_VERSION=3.12
 ARG TORCH_VERSION=2.8.0
 ARG TORCHVISION_VERSION=0.23.0
 ARG TORCHAUDIO_VERSION=2.8.0
 ARG TORCH_NPU_VERSION=2.8.0
+# 310P + openEuler 24.03 实际可用标签为 py3.11；Python 3.12 在下方通过 EPOL 安装
 ARG CANN_IMAGE=quay.io/ascend/cann:8.5.0-310p-openeuler24.03-py3.11
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 
@@ -33,12 +33,21 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TOKENIZERS_PARALLELISM=false \
     PATH="/opt/venv/bin:$PATH"
 
+# Ubuntu 22.04 无 Python 3.12 官方包，用 deadsnakes PPA
+# 关键修复：apt-get update 加 Retries/Timeout，抵御 NVIDIA 源同步瞬时不一致
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common \
+    apt-get update \
+        -o Acquire::Retries=10 \
+        -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30 \
+    && apt-get install -y --no-install-recommends software-properties-common \
     && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apt-get update \
+        -o Acquire::Retries=10 \
+        -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30 \
+    && apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev \
         gcc libpq-dev wget curl vim iputils-ping net-tools build-essential g++ \
     && rm -rf /var/lib/apt/lists/*
@@ -103,9 +112,8 @@ CMD ["python", "main.py", "--mode", "offline"]
 # ============================================================
 # Target: ascend  (linux/arm64)
 # ============================================================
-# 基础镜像：openEuler 24.03 LTS SP1（Euler 2.0 SP15 对应版本），
-# CANN 8.5.0 为 torch_npu 2.8.0 官方配套版本，Python 3.12 已预装。
-# 芯片：Ascend 310P（Atlas 300I DUO / Atlas 200I Pro）。
+# 基础镜像：CANN 8.5.0 + openEuler 24.03 (Euler 2.0 SP15 对应版本)，芯片 310P
+# 基础镜像自带 py3.11；Python 3.12 通过启用 EPOL 扩展源安装
 FROM ${CANN_IMAGE} AS ascend
 
 ARG PYTHON_VERSION
@@ -120,10 +128,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TOKENIZERS_PARALLELISM=false \
     PATH="/opt/venv/bin:$PATH"
 
-# openEuler 24.03 的 dnf 源提供 Python 3.12
+# 关键修复：python3.12 位于 EPOL 扩展源，需先启用
+# 1. 安装 dnf-plugins-core 以获得 config-manager
+# 2. 启用 epol 仓库
+# 3. 安装 python3.12 及构建工具
 RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
     --mount=type=cache,target=/var/lib/dnf,sharing=locked \
-    dnf install -y --setopt=install_weak_deps=False \
+    dnf install -y dnf-plugins-core \
+    && dnf config-manager --set-enabled epol \
+    && dnf install -y --setopt=install_weak_deps=False \
         python3.12 python3.12-devel \
         gcc gcc-c++ make cmake libpq-devel \
         wget curl vim iputils net-tools \
@@ -132,14 +145,10 @@ RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
 RUN python3.12 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
 
-RUN python${PYTHON_VERSION} -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
-
 WORKDIR /app
 COPY requirements.txt .
 
-# ARM64 上先装 CPU 版 torch（PyTorch 官方 aarch64 CPU wheel）
-# 再装 torch_npu 2.8.0 的 cp312 aarch64 预编译包
+# 官方配套：CANN 8.5.0 + torch 2.8.0 + torch_npu 2.8.0.post2 + Python 3.12 + AArch64
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir \
         torch==${TORCH_VERSION}+cpu \
