@@ -26,20 +26,20 @@ COPY requirements.txt .
 # 注意：请将 torch / torchvision / torchaudio 从 requirements.txt 中移除，
 # 避免重复安装或版本冲突
 RUN case "${TARGETARCH}" in \
-        amd64) \
-            # AMD64 (x86_64): Official PyTorch cu126 index (aligned to 2.8.0)
-            pip install --no-cache-dir \
-                torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
-                --index-url https://download.pytorch.org/whl/cu126 ;; \
-        arm64) \
-            # ARM64 (aarch64): NVIDIA Jetson AI Lab index for JetPack 6 / cu126
-            pip install --no-cache-dir \
-                torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
-                --index-url https://pypi.jetson-ai-lab.io/jp6/cu126 ;; \
-        *) \
-            echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+      amd64) \
+        pip install --no-cache-dir \
+          torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+          --index-url https://download.pytorch.org/whl/cu129 \
+        ;; \
+      arm64) \
+        pip install --no-cache-dir \
+          torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+          --index-url https://pypi.jetson-ai-lab.io/jp6/cu129 \
+        ;; \
+      *) \
+        echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 \
+        ;; \
     esac
-
 
 RUN pip install --no-cache-dir -r requirements.txt
 
