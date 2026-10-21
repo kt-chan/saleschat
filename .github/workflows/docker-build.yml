@@ -24,6 +24,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # QEMU 模拟 arm64 + 模型下载，预留足够时间；默认 360 分钟但显式声明更清晰
+    timeout-minutes: 180
     # 可选：只在正式 Release 时构建，忽略 pre-release
     # 若希望 pre-release 也产出镜像，删除下面这行 if
     if: github.event_name != 'release' || github.event.release.prerelease == false
@@ -78,8 +80,10 @@ jobs:
           push: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          secrets: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
           provenance: true
           sbom: true
 

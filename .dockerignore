@@ -13,6 +13,7 @@ output/
 log/
 cache/
 local_pgdata/
+models/
 
 # ==================== Python 运行时产物 ====================
 __pycache__/

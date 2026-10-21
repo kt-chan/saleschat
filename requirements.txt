@@ -11,12 +11,13 @@ dotenv==0.9.9
 python-dotenv==1.1.1
 
 # Semantics and Graph Processing
-torch==2.8.0
-torchvision==0.23.0
+# torch / torchvision / torchaudio 由 Dockerfile 分架构安装，此处不要包含
+# torch==2.8.0
+# torchvision==0.23.0
 # torchaudio==2.8.0
+sentence-transformers==3.2.1
 transformers==4.51.1
 pydantic-settings>=2.0.0
-sentence-transformers==3.2.1
 bertopic==0.17.4
 faiss-cpu==1.9.0
 numpy==1.26.4
