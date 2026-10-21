@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     wget curl \
     vim iputils-ping net-tools \
+    build-essential \
+    g++ \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
