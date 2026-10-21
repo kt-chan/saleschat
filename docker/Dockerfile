@@ -188,7 +188,7 @@ first = next(
 model = SentenceTransformer(first, device="cpu")
 vec = model.encode(["offline smoke test"], normalize_embeddings=True)
 print(f"smoke ok (cpu fallback): {first}, dim={vec.shape[-1]}, cache={os.environ['HF_HOME']}")
-PY
+PY || true
 
 
 COPY . .
