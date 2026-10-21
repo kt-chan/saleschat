@@ -13,7 +13,7 @@ ARG TORCH_VERSION=2.8.0
 ARG TORCHVISION_VERSION=0.23.0
 ARG TORCHAUDIO_VERSION=2.8.0
 ARG TORCH_NPU_VERSION=2.8.0
-ARG CANN_IMAGE=quay.io/ascend/cann:8.5.0-310p-openeuler24.03-py3.12
+ARG CANN_IMAGE=quay.io/ascend/cann:8.5.0-310p-openeuler24.03-py3.11
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 
 # ============================================================
@@ -120,13 +120,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TOKENIZERS_PARALLELISM=false \
     PATH="/opt/venv/bin:$PATH"
 
-# openEuler 使用 dnf；Python 3.12 已由 CANN 基础镜像预装，仅补装构建工具
+# openEuler 24.03 的 dnf 源提供 Python 3.12
 RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
     --mount=type=cache,target=/var/lib/dnf,sharing=locked \
     dnf install -y --setopt=install_weak_deps=False \
+        python3.12 python3.12-devel \
         gcc gcc-c++ make cmake libpq-devel \
         wget curl vim iputils net-tools \
     && dnf clean all
+
+RUN python3.12 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
 
 RUN python${PYTHON_VERSION} -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
