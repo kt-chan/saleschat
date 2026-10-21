@@ -146,7 +146,7 @@ RUN --mount=type=secret,id=HF_TOKEN,required=false \
 
 # 烟雾测试（支持无卡编译环境）
 # 修复后的烟雾测试（带无卡异常捕获保护）
-RUN python - <<'PY'
+RUN TORCH_DEVICE_BACKEND_AUTOLOAD=0 python - <<'PY'
 import os, sys
 from pathlib import Path
 
