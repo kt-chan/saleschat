@@ -51,8 +51,6 @@ def get_db_pool():
         cfg = get_settings()
         if cfg.use_embedded_db:
             try:
-                import pgserver
-
                 pg_data_dir = str(Path(cfg.cache_dir) / "local_pgdata")
                 os.makedirs(pg_data_dir, exist_ok=True)
 
