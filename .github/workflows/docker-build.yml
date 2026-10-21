@@ -90,7 +90,7 @@ jobs:
               path = snapshot_download(
                   rid,
                   revision=rev or None,
-                  cache_dir=str(hf_home),
+                  cache_dir=str(hub),
                   local_files_only=True,   # 双保险：不联网
               )
               print(f"offline hit: {rid} -> {path}")
