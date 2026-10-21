@@ -22,7 +22,83 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+# ── 快速模型验证：只装 hf CLI，1-2 分钟 ──────────────────────────
+  test-models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # 放 runner.temp，避免被 build job 的 `COPY . .` 带进镜像
+      HF_HOME: ${{ runner.temp }}/hf-cache
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install hf CLI
+        run: |
+          pip install --no-cache-dir "huggingface_hub>=0.30"
+          hf --help > /dev/null   # 提前失败，避免脚本跑一半才报 command not found
+
+      - name: Restore HF cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HF_HOME }}
+          key: hf-models-${{ hashFiles('models.txt') }}
+          restore-keys: |
+            hf-models-
+
+      - name: Run download_models.sh
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          chmod +x download_models.sh
+          ./download_models.sh models.txt
+
+      - name: Verify cache structure + offline resolve
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+
+          hf_home = Path(os.environ["HF_HOME"])
+          hub = hf_home / "hub"
+          assert hub.is_dir(), f"missing hub dir: {hub}"
+
+          specs = [
+              line.split("#", 1)[0].strip()
+              for line in Path("models.txt").read_text().splitlines()
+              if line.split("#", 1)[0].strip()
+          ]
+          assert specs, "empty manifest"
+
+          for spec in specs:
+              rid, _, rev = spec.partition("@")
+              repo_dir = hub / ("models--" + rid.replace("/", "--"))
+              assert repo_dir.is_dir(), f"missing cache: {repo_dir}"
+
+              snaps = [p for p in (repo_dir / "snapshots").iterdir() if p.is_dir()]
+              assert snaps, f"no snapshot for {rid}"
+
+              path = snapshot_download(
+                  rid,
+                  revision=rev or None,
+                  cache_dir=str(hf_home),
+                  local_files_only=True,   # 双保险：不联网
+              )
+              print(f"offline hit: {rid} -> {path}")
+
+          print("ALL MODEL CHECKS PASSED")
+          PY
+
+  # ── 多架构构建 ─────────────────────────────────────────────────
   build:
+    needs: test-models
     runs-on: ubuntu-latest
     # QEMU 模拟 arm64 + 模型下载，预留足够时间；默认 360 分钟但显式声明更清晰
     timeout-minutes: 180
@@ -83,7 +159,7 @@ jobs:
           secrets: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
           cache-from: type=gha
-          cache-to: type=gha,mode=min
+          cache-to: type=gha,mode=max
           provenance: true
           sbom: true
 
