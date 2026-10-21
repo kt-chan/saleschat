@@ -29,7 +29,9 @@
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
-        "PYTHONUNBUFFERED": "1"
+        "PYTHONUNBUFFERED": "1",
+        "HF_HOME": "./models/huggingface"
+
       },
       "justMyCode": false
     },
@@ -44,7 +46,8 @@
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
-        "PYTHONUNBUFFERED": "1"
+        "PYTHONUNBUFFERED": "1",
+        "HF_HOME": "./models/huggingface"
       },
       "justMyCode": false
     },
