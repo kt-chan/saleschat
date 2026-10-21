@@ -29,10 +29,3 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
-
-# ==================== Docker 自身文件 ====================
-# 避免把 docker 目录再次打包进镜像的 /app 目录
-docker/
-docker-compose.yml
-docker-compose.*.yml
-Dockerfile

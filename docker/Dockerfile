@@ -59,7 +59,7 @@ PY
 
 COPY . .
 
-RUN rm -f .env .env.* && rm -rf data output log cache
+RUN rm -f .env .env.* && rm -rf data output log cache docker
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
