@@ -27,15 +27,19 @@ COPY requirements.txt .
 # 避免重复安装或版本冲突
 RUN case "${TARGETARCH}" in \
         amd64) \
+            # AMD64 (x86_64): 官方 PyTorch cu126 索引，完全支持 CUDA
             pip install --no-cache-dir \
                 torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
                 --index-url https://download.pytorch.org/whl/cu126 ;; \
         arm64) \
-            # arm64 直接使用默认 PyPI 源（官方在 PyPI 上维护了 arm64 CPU 版本的 wheel）
+            # ARM64 (aarch64): 使用 NVIDIA Jetson AI Lab 源以获取 CUDA 版本
+            # 官方 PyPI 的 ARM64 wheel 通常是 CPU-only
             pip install --no-cache-dir \
-                torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 ;; \
-        *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac 
+                torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+                --index-url https://pypi.jetson-ai-lab.io/jp6/cu126 ;; \
+        *) \
+            echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac
 
 RUN pip install --no-cache-dir -r requirements.txt
 
