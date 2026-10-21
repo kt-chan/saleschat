@@ -46,18 +46,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.HF_HOME }}
-          key: hf-models-${{ hashFiles('models.txt') }}
+          key: hf-models-${{ hashFiles('docker/models-min.txt') }}
           restore-keys: |
             hf-models-
 
       - name: Run download_models.sh
+        working-directory: docker 
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           chmod +x download_models.sh
-          ./download_models.sh models.txt
+          ./download_models.sh models-min.txt
 
       - name: Verify cache structure + offline resolve
+        working-directory: docker
         env:
           HF_HUB_OFFLINE: "1"
         run: |
