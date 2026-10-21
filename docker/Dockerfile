@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 #
 # 双目标 Dockerfile：
-#   --target nvidia  → linux/amd64，NVIDIA A1000 (sm_86) + CUDA 12.8 + Python 3.12
+#   --target nvidia  → linux/amd64，NVIDIA (sm_86) + CUDA 12.8 + Python 3.12
 #   --target ascend  → linux/arm64，昇腾 310P + CANN 8.5.0 + openEuler 24.03 + Python 3.12
 #
 # 两个 target 都安装了 GPU/NPU 运行时；如果运行环境无卡，应用会回退 CPU。
@@ -12,9 +12,10 @@ ARG TORCH_VERSION=2.8.0
 ARG TORCHVISION_VERSION=0.23.0
 ARG TORCHAUDIO_VERSION=2.8.0
 ARG TORCH_NPU_VERSION=2.8.0
-# 310P + openEuler 24.03 实际可用标签为 py3.11；Python 3.12 在下方通过 EPOL 安装
+
+# 修复 1：调整为官方实际存在的 CUDA 12.8 运行时标签
+ARG CUDA_IMAGE=nvidia/cuda:12.8.0-runtime-ubuntu22.04
 ARG CANN_IMAGE=quay.io/ascend/cann:8.5.0-310p-openeuler24.03-py3.11
-ARG CUDA_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 
 # ============================================================
 # Target: nvidia  (linux/amd64)
@@ -34,9 +35,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/opt/venv/bin:$PATH"
 
 # Ubuntu 22.04 无 Python 3.12 官方包，用 deadsnakes PPA
-# 关键修复：apt-get update 加 Retries/Timeout，抵御 NVIDIA 源同步瞬时不一致
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update \
         -o Acquire::Retries=10 \
         -o Acquire::http::Timeout=30 \
@@ -73,7 +72,8 @@ RUN --mount=type=secret,id=HF_TOKEN,required=false \
     chmod +x ./docker/download_models.sh \
     && ./docker/download_models.sh docker/models.txt
 
-RUN python - <<'PY'
+# 修复 2：显式使用 /opt/venv/bin/python 执行测试
+RUN /opt/venv/bin/python - <<'PY'
 import os, ctypes, torch
 from pathlib import Path
 
@@ -112,8 +112,6 @@ CMD ["python", "main.py", "--mode", "offline"]
 # ============================================================
 # Target: ascend  (linux/arm64)
 # ============================================================
-# 基础镜像：CANN 8.5.0 + openEuler 24.03 (Euler 2.0 SP15 对应版本)，芯片 310P
-# 基础镜像自带 py3.11；Python 3.12 通过启用 EPOL 扩展源安装
 FROM ${CANN_IMAGE} AS ascend
 
 ARG PYTHON_VERSION
@@ -128,12 +126,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TOKENIZERS_PARALLELISM=false \
     PATH="/opt/venv/bin:$PATH"
 
-# 关键修复：python3.12 位于 EPOL 扩展源，需先启用
-# 1. 安装 dnf-plugins-core 以获得 config-manager
-# 2. 启用 epol 仓库
-# 3. 安装 python3.12 及构建工具
+# 启用 openEuler EPOL 扩展源并安装 Python 3.12
 RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
-    --mount=type=cache,target=/var/lib/dnf,sharing=locked \
     dnf install -y dnf-plugins-core \
     && dnf config-manager --set-enabled epol \
     && dnf install -y --setopt=install_weak_deps=False \
@@ -148,7 +142,6 @@ RUN python3.12 -m venv /opt/venv \
 WORKDIR /app
 COPY requirements.txt .
 
-# 官方配套：CANN 8.5.0 + torch 2.8.0 + torch_npu 2.8.0.post2 + Python 3.12 + AArch64
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir \
         torch==${TORCH_VERSION}+cpu \
@@ -164,7 +157,8 @@ RUN --mount=type=secret,id=HF_TOKEN,required=false \
     chmod +x ./docker/download_models.sh \
     && ./docker/download_models.sh docker/models.txt
 
-RUN python - <<'PY'
+# 显式使用 /opt/venv/bin/python 执行测试
+RUN /opt/venv/bin/python - <<'PY'
 import os, torch
 from pathlib import Path
 
