@@ -16,7 +16,6 @@ jobs:
   # 1) 每个架构在各自的原生 Runner 上并行构建 + push-by-digest
   # ==========================================================
   build:
-    # Release 只构建非 pre-release；tag push / 手动触发也构建
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'release' && github.event.release.prerelease == false) ||
@@ -53,7 +52,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 按架构构建，产出 digest，不直接打 tag（交给 merge job）
+      # ✅ outputs 必须是单行：逗号分隔的 key=value
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
@@ -62,12 +61,7 @@ jobs:
           file: ./docker/Dockerfile
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
-          outputs: |
-            type=image,
-            name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},
-            push-by-digest=true,
-            name-canonical=true,
-            push=true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           secrets: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
           cache-from: type=gha,scope=${{ matrix.target }}-v3
