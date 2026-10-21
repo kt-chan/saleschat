@@ -27,8 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      # 放 runner.temp，避免被 build job 的 `COPY . .` 带进镜像
-      HF_HOME: ${{ runner.temp }}/hf-cache
+      # 使用 workspace 的同级目录，避免 runner 上下文不可用的问题
+      HF_HOME: ${{ github.workspace }}/../hf-cache
       HF_HUB_DISABLE_PROGRESS_BARS: "1"
     steps:
       - uses: actions/checkout@v4
