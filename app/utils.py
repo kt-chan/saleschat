@@ -4,10 +4,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List, Any, Optional, Dict, Tuple
 from tqdm import tqdm
 import psycopg2
+import pgembed
 from psycopg2 import pool as pg_pool
 from pgvector.psycopg2 import register_vector
-import redis
-import fakeredis
 from sentence_transformers import SentenceTransformer
 
 from app.logger import get_logger
@@ -20,6 +19,7 @@ _embedder: Optional[SentenceTransformer] = None
 
 
 # ---------------- JSON ----------------
+
 
 def safe_json_loads(text: str) -> dict:
     if not text:
@@ -44,6 +44,7 @@ def safe_json_loads(text: str) -> dict:
 
 # ---------------- DB ----------------
 
+
 def get_db_pool():
     global _db_pool, _embedded_pg_server
     if _db_pool is None:
@@ -51,20 +52,36 @@ def get_db_pool():
         if cfg.use_embedded_db:
             try:
                 import pgserver
+
                 pg_data_dir = str(Path(cfg.cache_dir) / "local_pgdata")
                 os.makedirs(pg_data_dir, exist_ok=True)
-                _embedded_pg_server = pgserver.get_server(pg_data_dir, cleanup_mode="stop")
+
+                _embedded_pg_server = _embedded_pg_server = pgembed.get_server(
+                    pg_data_dir
+                )
                 dsn = _embedded_pg_server.get_uri()
-                _db_pool = pg_pool.ThreadedConnectionPool(cfg.db_pool_min, cfg.db_pool_max, dsn=dsn)
+                _db_pool = pg_pool.ThreadedConnectionPool(
+                    cfg.db_pool_min, cfg.db_pool_max, dsn=dsn
+                )
                 log.info("本地嵌入式 PostgreSQL 启动成功")
+
+                if not pgembed.has_extension("pgvector"):
+                    log.error("pgembed-pgvector 未正确安装，向量检索将不可用")
+                else:
+                    log.info("pgvector 扩展已就绪")
+
             except Exception as e:
                 log.error(f"本地数据库启动失败: {e}")
                 raise
         else:
             _db_pool = pg_pool.ThreadedConnectionPool(
-                cfg.db_pool_min, cfg.db_pool_max,
-                host=cfg.db_host, port=cfg.db_port, dbname=cfg.db_name,
-                user=cfg.db_user, password=cfg.db_password,
+                cfg.db_pool_min,
+                cfg.db_pool_max,
+                host=cfg.db_host,
+                port=cfg.db_port,
+                dbname=cfg.db_name,
+                user=cfg.db_user,
+                password=cfg.db_password,
             )
             log.info("远程 Pgvector ThreadedConnectionPool 初始化完成")
     return _db_pool
@@ -181,55 +198,22 @@ def init_db():
 
 # ---------------- Embedder ----------------
 
+
 def get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
         cfg = get_settings()
-        log.info(f"Loading embedding model: {cfg.embedding_model} on {cfg.embedding_device}")
-        _embedder = SentenceTransformer(cfg.embedding_model, device=cfg.embedding_device)
+        log.info(
+            f"Loading embedding model: {cfg.embedding_model} on {cfg.embedding_device}"
+        )
+        _embedder = SentenceTransformer(
+            cfg.embedding_model, device=cfg.embedding_device
+        )
     return _embedder
 
 
-# ---------------- Session store (retained for optional streaming use) ----------------
-
-class SessionStore:
-    def __init__(self):
-        cfg = get_settings()
-        self.ttl = cfg.session_ttl
-        self.memory: Dict[str, dict] = {}
-        self.use_redis = False
-        self.use_fake_redis = False
-
-        if cfg.use_embedded_redis:
-            try:
-                self.r = fakeredis.FakeRedis(decode_responses=True)
-                self.use_fake_redis = True
-                log.info("已启用本地内存模拟 Redis (fakeredis) 存储会话")
-            except Exception as e:
-                log.error(f"fakeredis 初始化失败: {e}")
-        elif cfg.redis_url:
-            try:
-                self.r = redis.from_url(cfg.redis_url, decode_responses=True)
-                self.r.ping()
-                self.use_redis = True
-                log.info("远程 Redis 会话存储已连接")
-            except Exception as e:
-                log.warning(f"远程 Redis 连接失败，退化为本地字典存储: {e}")
-
-    def get(self, sid: str) -> dict:
-        if self.use_fake_redis or self.use_redis:
-            data = self.r.get(f"session:{sid}")
-            return json.loads(data) if data else {"stage": "", "history": [], "trace": []}
-        return self.memory.get(sid, {"stage": "", "history": [], "trace": []})
-
-    def set(self, sid: str, state: dict):
-        if self.use_fake_redis or self.use_redis:
-            self.r.setex(f"session:{sid}", self.ttl, json.dumps(state, ensure_ascii=False))
-        else:
-            self.memory[sid] = state
-
-
 # ---------------- Concurrency ----------------
+
 
 def retry(max_retries: int = 3, backoff: float = 2.0):
     def decorator(func):
@@ -241,12 +225,16 @@ def retry(max_retries: int = 3, backoff: float = 2.0):
                 except Exception:
                     if attempt == max_retries - 1:
                         raise
-                    time.sleep(backoff ** attempt)
+                    time.sleep(backoff**attempt)
+
         return wrapper
+
     return decorator
 
 
-def parallel_map(func: Callable, items: List[Any], max_workers: int = 8, desc: str = "Processing") -> List[Any]:
+def parallel_map(
+    func: Callable, items: List[Any], max_workers: int = 8, desc: str = "Processing"
+) -> List[Any]:
     if not items:
         return []
     results = [None] * len(items)
@@ -265,6 +253,7 @@ def parallel_map(func: Callable, items: List[Any], max_workers: int = 8, desc: s
 
 
 # ---------------- Dialog parsing ----------------
+
 
 def _build_dialog_patterns(cfg) -> Tuple[re.Pattern, str]:
     role_pattern = "|".join(re.escape(r) for r in cfg.dialog_role_prefixes)
@@ -342,11 +331,15 @@ def merge_consecutive(turns: List[Dict], sep: str = "") -> List[Dict]:
             blocks[-1]["text"] += sep + t["text"]
             blocks[-1]["end_idx"] = idx
         else:
-            blocks.append({"role": t["role"], "text": t["text"], "start_idx": idx, "end_idx": idx})
+            blocks.append(
+                {"role": t["role"], "text": t["text"], "start_idx": idx, "end_idx": idx}
+            )
     return blocks
 
 
-def pair_turns(turns: List[Dict], sep: str = "", customer_role: Optional[str] = None) -> List[Dict]:
+def pair_turns(
+    turns: List[Dict], sep: str = "", customer_role: Optional[str] = None
+) -> List[Dict]:
     cfg = get_settings()
     customer_role = customer_role or cfg.dialog_customer_role
     blocks = merge_consecutive(turns, sep=sep)
@@ -359,17 +352,23 @@ def pair_turns(turns: List[Dict], sep: str = "", customer_role: Optional[str] = 
             continue
         if i + 1 < len(blocks) and blocks[i + 1]["role"] != customer_role:
             a = blocks[i + 1]
-            pairs.append({
-                "q_idx": (b["start_idx"], b["end_idx"]),
-                "a_idx": (a["start_idx"], a["end_idx"]),
-                "question": b["text"], "answer": a["text"],
-            })
+            pairs.append(
+                {
+                    "q_idx": (b["start_idx"], b["end_idx"]),
+                    "a_idx": (a["start_idx"], a["end_idx"]),
+                    "question": b["text"],
+                    "answer": a["text"],
+                }
+            )
             i += 2
         else:
-            pairs.append({
-                "q_idx": (b["start_idx"], b["end_idx"]),
-                "a_idx": None, "question": b["text"], "answer": None,
-            })
+            pairs.append(
+                {
+                    "q_idx": (b["start_idx"], b["end_idx"]),
+                    "a_idx": None,
+                    "question": b["text"],
+                    "answer": None,
+                }
+            )
             i += 1
     return pairs
-

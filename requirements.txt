@@ -15,6 +15,7 @@ torch==2.6.0
 torchvision==0.21.0
 torchaudio==2.6.0
 transformers==4.51.1
+pydantic-settings>=2.0.0
 sentence-transformers==3.2.1
 bertopic==0.17.4
 faiss-cpu==1.9.0
@@ -25,12 +26,13 @@ networkx==3.4.2
 umap-learn>=0.5.0
 hdbscan>=0.8.0
 jieba>=0.42.1
-
 rapidfuzz>=3.0.0
-psycopg2-binary>=2.9.9
-pgvector>=0.2.4
-redis>=5.0.0
-pydantic-settings>=2.0.0
-pgserver>=0.1.4
-fakeredis>=2.22.0
 
+# ==================== VectorDB ====================
+pgembed==0.2.0
+pgvector==0.5.1
+psycopg2-binary==2.9.13
+
+# ==================== Web 服务 ====================
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0

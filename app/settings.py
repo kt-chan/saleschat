@@ -43,11 +43,10 @@ class Settings(BaseSettings):
 
     # Runtime
     use_embedded_db: bool = True
-    use_embedded_redis: bool = True
     clear_cache_on_start: bool = False
     state_machine_mode: str = "guide"
 
-    # DB / Redis
+    # DB
     db_host: str = "localhost"
     db_port: int = 5432
     db_name: str = "cca_db"
@@ -56,7 +55,6 @@ class Settings(BaseSettings):
     db_pool_min: int = 2
     db_pool_max: int = 50
     db_write_batch_size: int = 500
-    redis_url: str = ""
     session_ttl: int = 1800
 
     # Paths

@@ -59,7 +59,7 @@ services:
       - ../data:/app/data
       - ../output:/app/output
       - ../log:/app/log
-      - ../cache:/app/cache
+      - ../models:/app/models
       - ../testllm.py:/app/testllm.py
     depends_on:
       db:
