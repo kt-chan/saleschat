@@ -23,24 +23,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # 2. Redis 缓存 (用于 Session 状态持久化)
-  redis:
-    image: redis:7-alpine
-    container_name: cca_redis
-    environment:
-      TZ: Asia/Hong_Kong
-    ports:
-      - "6379:6379"
-    volumes:
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-      - redisdata:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   # 3. 应用服务 (离线/在线)
   saleschat:
     build:
@@ -49,6 +31,9 @@ services:
     container_name: cca_saleschat
     environment:
       TZ: Asia/Hong_Kong
+      HF_HOME: /app/models/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     env_file:
       - ../.env
     volumes:
@@ -63,8 +48,6 @@ services:
       - ../testllm.py:/app/testllm.py
     depends_on:
       db:
-        condition: service_healthy
-      redis:
         condition: service_healthy
     # 默认执行离线构建；如果要跑在线测试，使用：
     # command: ["tail", "-f", "/dev/null"]

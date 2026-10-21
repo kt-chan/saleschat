@@ -1,130 +1,129 @@
-name: Build & Push Multi-Arch Docker Image
+name: Build and Push Container Images
 
 on:
-  # 发布新 Release 时触发双架构构建并推送
+  push:
+    tags:
+      - 'v*'
   release:
     types: [published]
-  # PR 只做构建验证，不推送
-  pull_request:
-    branches: [main]
-  # 允许手动触发，便于重跑
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
 
-permissions:
-  contents: read
-  packages: write
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-# ── 快速模型验证：只装 hf CLI，1-2 分钟 ──────────────────────────
-  # test-models:
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 15
-  #   env:
-  #     # 使用 workspace 的同级目录，避免 runner 上下文不可用的问题
-  #     HF_HOME: ${{ github.workspace }}/../hf-cache
-  #     HF_HUB_DISABLE_PROGRESS_BARS: "1"
-  #   steps:
-  #     - uses: actions/checkout@v4
-
-  #     - uses: actions/setup-python@v5
-  #       with:
-  #         python-version: '3.12'
-
-  #     - name: Install hf CLI
-  #       run: |
-  #         pip install --no-cache-dir "huggingface_hub>=0.30"
-  #         hf --help > /dev/null   # 提前失败，避免脚本跑一半才报 command not found
-
-  #     - name: Restore HF cache
-  #       uses: actions/cache@v4
-  #       with:
-  #         path: ${{ env.HF_HOME }}
-  #         key: hf-models-${{ hashFiles('docker/models-min.txt') }}
-  #         restore-keys: |
-  #           hf-models-
-
-  #     - name: Run download_models.sh
-  #       working-directory: docker 
-  #       env:
-  #         HF_TOKEN: ${{ secrets.HF_TOKEN }}
-  #       run: |
-  #         chmod +x download_models.sh
-  #         ./download_models.sh models-min.txt
-
-  #     - name: Verify cache structure + offline resolve
-  #       working-directory: docker
-  #       env:
-  #         HF_HUB_OFFLINE: "1"
-  #       run: |
-  #         python - <<'PY'
-  #         import os
-  #         from pathlib import Path
-  #         from huggingface_hub import snapshot_download
-
-  #         hf_home = Path(os.environ["HF_HOME"])
-  #         hub = hf_home / "hub"
-  #         assert hub.is_dir(), f"missing hub dir: {hub}"
-
-  #         specs = [
-  #             line.split("#", 1)[0].strip()
-  #             for line in Path("models.txt").read_text().splitlines()
-  #             if line.split("#", 1)[0].strip()
-  #         ]
-  #         assert specs, "empty manifest"
-
-  #         for spec in specs:
-  #             rid, _, rev = spec.partition("@")
-  #             repo_dir = hub / ("models--" + rid.replace("/", "--"))
-  #             assert repo_dir.is_dir(), f"missing cache: {repo_dir}"
-
-  #             snaps = [p for p in (repo_dir / "snapshots").iterdir() if p.is_dir()]
-  #             assert snaps, f"no snapshot for {rid}"
-
-  #             path = snapshot_download(
-  #                 rid,
-  #                 revision=rev or None,
-  #                 cache_dir=str(hub),
-  #                 local_files_only=True,   # 双保险：不联网
-  #             )
-  #             print(f"offline hit: {rid} -> {path}")
-
-  #         print("ALL MODEL CHECKS PASSED")
-  #         PY
-
-  # ── 多架构构建 ─────────────────────────────────────────────────
+  # ==========================================================
+  # 1) 每个架构在各自的原生 Runner 上并行构建 + push-by-digest
+  # ==========================================================
   build:
-    # validate huggingface model download, for debug only
-    # needs: test-models
-    runs-on: ubuntu-latest
-    # QEMU 模拟 arm64 + 模型下载，预留足够时间；默认 360 分钟但显式声明更清晰
+    # Release 只构建非 pre-release；tag push / 手动触发也构建
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'release' && github.event.release.prerelease == false) ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            target: nvidia
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            target: ascend
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
-    # 可选：只在正式 Release 时构建，忽略 pre-release
-    # 若希望 pre-release 也产出镜像，删除下面这行 if
-    if: github.event_name != 'release' || github.event.release.prerelease == false
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Release 事件下确保检出 tag 指向的 commit
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
 
-      # GHCR 要求镜像名全小写
       - name: Normalize image name to lowercase
         run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 按架构构建，产出 digest，不直接打 tag（交给 merge job）
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
+          outputs: |
+            type=image,
+            name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},
+            push-by-digest=true,
+            name-canonical=true,
+            push=true
+          secrets: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
+          cache-from: type=gha,scope=${{ matrix.target }}-v3
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}-v3
+          provenance: false
+          sbom: false
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.target }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ==========================================================
+  # 2) 合并两个 digest 为多架构 manifest，并打上正式 tag
+  # ==========================================================
+  merge:
+    needs: build
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'release' && github.event.release.prerelease == false) ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout (for metadata context)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          fetch-depth: 1
+
+      - name: Normalize image name to lowercase
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (tags & labels)
         id: meta
@@ -132,42 +131,21 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # Release: v1.2.3 -> 1.2.3 / 1.2 / 1 / latest
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ github.event_name == 'release' && github.event.release.prerelease == false }}
-            # PR / 手动触发时的辅助标签
-            type=ref,event=pr
             type=sha,prefix=sha-,format=short
             type=raw,value=manual,enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - name: Login to GHCR
-        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push (linux/amd64 + linux/arm64)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          secrets: |
-            HF_TOKEN=${{ secrets.HF_TOKEN }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Verify multi-arch manifest
-        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         run: |
           TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
           echo "Inspecting $TAG"
