@@ -13,7 +13,7 @@ python-dotenv==1.1.1
 # Semantics and Graph Processing
 torch==2.8.0
 torchvision==0.23.0
-torchaudio==2.6.0
+# torchaudio==2.8.0
 transformers==4.51.1
 pydantic-settings>=2.0.0
 sentence-transformers==3.2.1
