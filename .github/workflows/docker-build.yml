@@ -67,8 +67,8 @@ jobs:
           file: ./docker/Dockerfile
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
-          # push-by-digest 要求 name 中必须带显式 tag，否则报 "tag is needed when pushing to registry"
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest,push-by-digest=true,name-canonical=true,push=true
+          # 修复：移除固定的 :latest 标签，允许 push-by-digest 正常按摘要推送
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           secrets: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
           cache-from: type=gha,scope=${{ matrix.target }}-v3
