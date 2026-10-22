@@ -8,19 +8,20 @@ on:
     types: [published]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
 
-# 显式声明 GITHUB_TOKEN 权限：
-#   contents: read  → checkout 代码
-#   packages: write → 推送镜像与 manifest 到 GHCR
 permissions:
   contents: read
   packages: write
 
 jobs:
   # ==========================================================
-  # 1) 每个架构在各自的原生 Runner 上并行构建 + push-by-digest
+  # 1) 并行构建 + 推送多架构 + 直接导出原生架构 tar 包
   # ==========================================================
   build:
     if: |
@@ -34,9 +35,11 @@ jobs:
           - platform: linux/amd64
             runner: ubuntu-latest
             target: nvidia
+            arch_suffix: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             target: ascend
+            arch_suffix: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
 
@@ -59,7 +62,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push by digest
+      # ==========================================================
+      # 优化点：通过多 outputs 同时推送（by-digest）并直接打包为本地 tar
+      # ==========================================================
+      - name: Build, push by digest, and export to Tar
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -67,8 +73,9 @@ jobs:
           file: ./docker/Dockerfile
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
-          # 修复：移除固定的 :latest 标签，允许 push-by-digest 正常按摘要推送
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+            type=docker,dest=saleschat-${{ matrix.arch_suffix }}.tar
           secrets: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
           cache-from: type=gha,scope=${{ matrix.target }}-v3
@@ -76,11 +83,20 @@ jobs:
           provenance: false
           sbom: false
 
+      - name: Upload Tar Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: saleschat-${{ matrix.arch_suffix }}-tar
+          path: saleschat-${{ matrix.arch_suffix }}.tar
+          retention-days: 3
+      # ==========================================================
+
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          # Strip 'sha256:' and write cleanly into a file named after the target
+          echo "${digest#sha256:}" > "/tmp/digests/${{ matrix.target }}"
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
@@ -91,7 +107,7 @@ jobs:
           retention-days: 1
 
   # ==========================================================
-  # 2) 合并两个 digest 为多架构 manifest，并打上正式 tag
+  # 2) 合并多架构 manifest 并打上正式 tag
   # ==========================================================
   merge:
     needs: build
@@ -142,9 +158,14 @@ jobs:
       - name: Create and push multi-arch manifest
         working-directory: /tmp/digests
         run: |
-          # DOCKER_METADATA_OUTPUT_JSON 由 metadata-action 注入，供后续 step 使用
           TAG_ARGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          SOURCE_ARGS=$(for f in *; do echo -n "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:$f "; done)
+          SOURCE_ARGS=""
+          for f in *; do
+            if [ -f "$f" ]; then
+              digest_val=$(cat "$f")
+              SOURCE_ARGS="${SOURCE_ARGS} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:${digest_val}"
+            fi
+          done
           echo "Tags: $TAG_ARGS"
           echo "Sources: $SOURCE_ARGS"
           docker buildx imagetools create $TAG_ARGS $SOURCE_ARGS
