@@ -1,605 +1,420 @@
-# 催收实时对话助手 (Credit Collection Real-time Assistant)
+# 催收话术智能推荐系统 (CCA)
 
-基于 **10 万通催收会话** 构建的实时话术推荐系统。通过 LLM 离线打标、BERTopic 主题聚类、SOP 图谱构建与多路融合检索，在通话过程中为催收员推荐最佳话术，同时沉淀催收 SOP 知识图谱。
+> **Collections Conversation Assistant** — 面向催收坐席的实时话术推荐引擎。
+> 基于 SOP 图谱的双分支混合检索（pgvector + Golden QA），支持 CUDA / Ascend NPU / CPU 多后端部署。
 
 ---
 
 ## 目录
 
+- [项目简介](#项目简介)
 - [核心特性](#核心特性)
-- [系统架构](#系统架构)
-- [项目结构](#项目结构)
+- [架构与数据流](#架构与数据流)
+- [环境要求](#环境要求)
 - [快速开始](#快速开始)
-- [环境变量](#环境变量)
-- [数据格式](#数据格式)
-- [使用指南](#使用指南)
-- [核心配置](#核心配置)
-- [VS Code 调试](#vs-code-调试)
-- [输出产物](#输出产物)
-- [性能指标](#性能指标)
-- [常见问题](#常见问题)
-- [技术栈](#技术栈)
+- [使用方式](#使用方式)
+- [配置说明](#配置说明)
+- [目录结构](#目录结构)
+- [硬件后端](#硬件后端)
+- [性能调优](#性能调优)
+- [故障排查](#故障排查)
+- [开发与测试](#开发与测试)
+
+---
+
+## 项目简介
+
+CCA 是一个**离线建库 + 在线检索**的两阶段系统，用于在催收通话过程中，根据当前对话上下文为坐席推荐下一句最合适的应答话术。
+
+- **离线阶段**：解析历史通话 → LLM 双级打标（会话级 + 话对级）→ 向量化入库 → 图谱合成"经典 Q&A"。
+- **在线阶段**：解析实时对话 → 双分支混合检索（向量 + 图谱 golden QA）→ 图感知投票 → 返回最佳话术。
+
+系统不依赖在线 LLM 推理，在线延迟稳定在 **毫秒级**（典型 20–80 ms，视检索深度与硬件而定）。
 
 ---
 
 ## 核心特性
 
 | 特性 | 说明 |
-|------|------|
-| **零训练** | 使用 BERTopic 无监督聚类，无需标注数据与模型训练 |
-| **LLM 离线打标** | GPT-4o-mini 并发打标，Session 级 + Pair 级双粒度标签 |
-| **SOP 图谱** | 从高绩效通话中萃取 7 大阶段、跳转表、话术库 |
-| **多路融合检索** | 主题 / 向量 / 标签 / 图谱四路并行，RRF 融合排序 |
-| **超低延迟** | 在线 P95 ≤ 500ms，主路径仅 ~200ms |
-| **配置数据驱动** | 从 LLM 标签挖掘 + 人工 config.py 融合，自动优化 |
-| **可解释** | 每条推荐有 SOP 节点、意图、召回来源依据 |
-| **合规过滤** | 禁止话术实时拦截，合规检查点全覆盖 |
+|---|---|
+| **SOP 图谱驱动** | 阶段（stage）/ 意图（intent）/ 转移（transition）显式建模，检索时按图跳数衰减，避免跨阶段语义漂移 |
+| **双分支混合检索** | Branch A: pgvector 元数据过滤；Branch B: 内存 golden QA 点积；分数融合 + 平方加权投票 |
+| **三种检索模式** | `off`（无约束）/ `guide`（图引导，允许跳转）/ `enforce`（锁定阶段，失败即拒绝） |
+| **多后端 Embedding** | 本地多卡（CUDA / Ascend NPU）数据并行，或远程 TEI HTTP 服务；同代码切换 |
+| **离线-在线语义一致** | 离线入库与在线检索共用同一 `encode(normalize_embeddings=True)` 口径；L2 归一化后点积 ≡ 余弦相似度 |
+| **嵌入式数据库** | `pgembed` 启动本地 PostgreSQL + pgvector，零运维；也可指向外部集群 |
+| **容错与可观测性** | 单 chunk 重试、手动 HF 推理兜底、设备令牌队列超时、详细的 `debug.trace` |
 
 ---
 
-## 系统架构
+## 架构与数据流
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                       离线层                                │
-│                                                             │
-│  10万通ASR会话 (data/calls.jsonl)                           │
-│      ↓ parse_dialog                                         │
-│  parsed_calls.jsonl (结构化 turns + turn_id)                │
-│      ↓ LLM 并发打标 (Session + Pair 两级)                   │
-│  session_labels.jsonl + pair_labels.jsonl                   │
-│      ↓ ConfigOptimizer (数据驱动 + 人工基线)                │
-│  optimized_config.json                                      │
-│      ↓ 用优化配置构建                                       │
-│  ┌────────────┬────────────┬────────────┬────────────┐      │
-│  │ BERTopic   │ QA 库      │ SOP 图谱   │ Faiss 索引 │      │
-│  │ 7 主题     │ 数万 QA 对 │ 节点+跳转表│ 向量检索   │      │
-│  └────────────┴────────────┴────────────┴────────────┘      │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│                       在线层                                │
-│                                                             │
-│  ASR 实时文本                                               │
-│      ↓ StateTracker (规则状态机, O(1) 跳转)                 │
-│  当前 SOP 阶段 + 意图 + 情绪                                │
-│      ↓ 并行多路召回                                         │
-│  [主题] [向量] [标签] [图谱]                                │
-│      ↓ RRF 融合 + 合规过滤                                  │
-│  Top-3 推荐话术 → 客服界面                                  │
-│                                                             │
-│  延迟 ≈ 200ms（预算 500ms）                                 │
-└─────────────────────────────────────────────────────────────┘
+
+┌──────────────────────── 离线阶段 (--mode offline) ────────────────────────┐
+│                                                                          │
+│  calls.jsonl                                                             │
+│      │                                                                   │
+│      ▼  parse_dialog                                                     │
+│  calls[] ──► LLMLabeler.run_sessions ──► session_labels.jsonl           │
+│      │                                     │                             │
+│      │                                     ▼                             │
+│      └──► LLMLabeler.run_pairs ────────► pair_labels.jsonl              │
+│                                              │                           │
+│                                              ▼  PgvectorWriter           │
+│                                        qa_pairs (pgvector)              │
+│                                              │                           │
+│                                              ▼  GoldenScriptGenerator    │
+│                                        sop_graph.json                   │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────── 在线阶段 (--mode online) ─────────────────────────┐
+│                                                                          │
+│  raw text ──► parse_dialog ──► _build_suggest_query (窗口裁剪)          │
+│                                              │                           │
+│                                              ▼                           │
+│                                    HybridRetriever                       │
+│                              ┌───────────────┴───────────────┐          │
+│                              ▼                               ▼          │
+│                         pgvector                         golden QA      │
+│                         (SQL)                            (内存点积)     │
+│                              └───────────────┬───────────────┘          │
+│                                              ▼                           │
+│                              merge (hop decay) ──► vote (stage+intent)  │
+│                                              ▼                           │
+│                                    best script + alternates              │
+└──────────────────────────────────────────────────────────────────────────┘
+
 ```
+
+**关键设计点**：
+
+1. **阶段/意图约束**：pgvector 检索前先按 `(stage, primary_intent) IN (...)` 过滤，候选节点由 SOP 图 BFS 决定（`hybrid_max_hops` 控制跳数）。
+2. **跳数衰减**：`score = raw_sim × weight × hop_decay[hop]`，默认 `[1.0, 0.95, 0.85]`。
+3. **投票**：对 top-N 结果按 `score²` 加权投票，先定 stage 再定 intent，避免弱证据干扰。
+4. **Golden QA 优先**：`golden` 命中时作为主推荐，`pgvector` 作为 alternate，兼顾精度与召回。
 
 ---
 
-## 项目结构
+## 环境要求
 
-```
-credit_collection_assistant/
-├── .env                      # 环境变量（不提交）
-├── .env.example              # 环境变量模板
-├── .vscode/                  # VS Code 调试配置
-│   ├── launch.json
-│   ├── settings.json
-│   ├── tasks.json
-│   └── extensions.json
-├── data/                     # 输入数据
-│   └── calls.jsonl           # 10万通原始 ASR 会话
-├── output/                   # 输出产物（自动创建）
-│   ├── parsed_calls.jsonl    # 解析后的会话
-│   ├── session_labels.jsonl  # Session 级 LLM 标签
-│   ├── pair_labels.jsonl     # Pair 级 LLM 标签
-│   ├── optimized_config.json # 优化后的配置
-│   ├── bertopic_model/       # BERTopic 模型
-│   ├── qa_pairs.json         # 经典 QA 库
-│   ├── sop_graph.json        # SOP 图谱
-│   ├── faiss/                # 向量索引
-│   └── testset.jsonl         # 在线评测集
-├── log/                      # 日志目录（自动创建）
-│   ├── cca.log               # 全量日志
-│   └── cca.error.log         # 错误日志
-├── cache/                    # LLM 打标缓存（自动创建）
-│   ├── llm_sessions/
-│   └── llm_pairs/
-├── config.py                 # 原始配置基线（人工经验）
-├── prompts.yaml              # LLM 打标 Prompt 模板
-├── settings.py               # 环境变量加载
-├── logger.py                 # 日志配置
-├── utils.py                  # 工具：并发/重试/缓存
-├── offline.py                # 离线层
-├── online.py                 # 在线层
-├── main.py                   # 主流程
-├── evaluate.py               # 评测
-└── requirements.txt
-```
+| 组件 | 版本 | 说明 |
+|---|---|---|
+| **Python** | 3.12.x | 已验证与 PyTorch 2.10 / torch_npu 2.10 兼容 |
+| **PyTorch** | `2.10.0`（CPU wheel） | `torch.accelerator` 统一设备管理 |
+| **torch_npu** | `2.10.0.post4`（对应 `v2.10.0-26.0.0`） | 仅 NPU 节点安装 |
+| **CANN** | `9.0.0` | 仅 NPU 节点 |
+| **npu-smi** | `26.0` | 仅 NPU 节点 |
+| **sentence-transformers** | `>=4.0.0` | NPU `device=` 参数支持 |
+| **PostgreSQL** | 内嵌（pgembed）或 ≥15 外部实例 | 需 pgvector 扩展 |
+
+**硬件支持**：
+
+- 🟢 **CPU** — 无加速器时的兜底
+- 🟢 **NVIDIA CUDA** — 单卡或多卡数据并行
+- 🟢 **Ascend NPU** — 通过 `torch_npu` + CANN 9.0
 
 ---
 
 ## 快速开始
 
-### 1. 环境准备
+### 1. 克隆与依赖
 
 ```bash
-# 克隆项目
-git clone <repo-url>
-cd credit_collection_assistant
+git clone <repo> cca && cd cca
 
-# 创建虚拟环境（WSL / Linux）
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 安装依赖
+# 通用依赖
 pip install -r requirements.txt
-```
 
-### 2. 配置环境变量
+# NPU 节点额外安装（CUDA / CPU 节点跳过）
+pip install -r requirements-npu.txt
 
-```bash
+# 环境变量
 cp .env.example .env
-# 编辑 .env，至少填入 LLM_API_KEY
+# 编辑 .env：至少填写 LLM_API_KEY
 ```
 
-### 3. 准备数据
+NPU 环境前置：
 
 ```bash
-mkdir -p data output log cache
-# 将 10 万通会话写入 data/calls.jsonl（每行一个 JSON）
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=0,1   # 限定可见卡（可选）
 ```
 
-### 4. 运行离线流程
+2. 准备数据
+
+将历史通话数据放入 ./data/calls.jsonl，每行一个 JSON：
+
+```jsonl
+{"call_id": "C001", "text": "催收员：您好，请问是张先生吗？\n客户：是我。\n催收员：您名下信用卡本期逾期1900元，请问能处理吗？\n客户：我最近被裁员了，暂时没有收入。"}
+{"call_id": "C002", "text": "..."}
+```
+
+对话文本支持 行模式（每行一条 角色:内容）或 分隔符模式（；/; 分隔），自动检测。
+
+3. 运行离线建库
 
 ```bash
 python main.py --mode offline
 ```
 
-### 5. 在线演示
+输出：
+
+· output/session_labels.jsonl — 会话级标签
+· output/pair_labels.jsonl — 话对级标签
+· output/sop_graph.json — SOP 图谱 + golden QA
+· qa_pairs 表（pgvector 向量库）
+
+4. 运行在线演示
 
 ```bash
 python main.py --mode online
 ```
 
-### 6. 评测
+演示会分别以 fast path（给定 stage_hint）和 slow path（自动推断）两条路径检索，并打印匹配结果、耗时与 debug 信息。
 
-```bash
-python evaluate.py
-```
-
----
-
-## 环境变量
-
-### 必填项
-
-| 变量 | 说明 | 示例 |
-|------|------|------|
-| `LLM_API_KEY` | LLM API 密钥 | `sk-xxx` |
-
-### 完整配置（`.env.example`）
-
-```bash
-# ==================== LLM 配置 ====================
-LLM_PROVIDER=openai
-LLM_API_KEY=sk-your-key-here
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=gpt-4o-mini
-LLM_TEMPERATURE=0.1
-LLM_TIMEOUT=60
-LLM_MAX_RETRIES=3
-LLM_MAX_CONCURRENCY=16
-LLM_BATCH_SIZE=500
-
-# ==================== Embedding 配置 ====================
-EMBEDDING_MODEL=BAAI/bge-base-zh-v1.5
-EMBEDDING_BATCH_SIZE=256
-EMBEDDING_DEVICE=cpu
-EMBEDDING_MAX_LENGTH=128
-
-# ==================== BERTopic 配置 ====================
-BERTOPIC_MIN_TOPIC_SIZE=20
-BERTOPIC_ZEROSHOT_SIMILARITY=0.7
-BERTOPIC_SEED_MULTIPLIER=2
-BERTOPIC_UMAP_NEIGHBORS=15
-BERTOPIC_UMAP_COMPONENTS=5
-BERTOPIC_HDBSCAN_MIN_SIZE=20
-
-# ==================== 数据路径 ====================
-DATA_DIR=./data
-OUTPUT_DIR=./output
-CACHE_DIR=./cache
-LOG_DIR=./log
-CALLS_FILE=./data/calls.jsonl
-PROMPT_FILE=./prompts.yaml
-
-# ==================== 解析后会话缓存 ====================
-SAVE_PARSED_CALLS=true
-PARSED_CALLS_FILE=./output/parsed_calls.jsonl
-
-# ==================== 日志配置 ====================
-LOG_LEVEL=INFO
-LOG_ROTATION=100 MB
-LOG_RETENTION=7 days
-LOG_ENABLE_FILE=true
-LOG_ENABLE_CONSOLE=true
-
-# ==================== 在线检索 ====================
-ONLINE_TOP_K=3
-ONLINE_TIMEOUT_MS=500
-ONLINE_EMBEDDING_CACHE_SIZE=1000
-ONLINE_RECALL_TOP_K=20
-ONLINE_RRF_K=60
-
-# ==================== 配置优化 ====================
-CONFIG_OPTIMIZE_ENABLED=true
-CONFIG_MIN_QUALITY_SCORE=0.6
-
-# ==================== 并发控制 ====================
-CONCURRENCY_LABELER=16
-CONCURRENCY_EMBEDDING=4
-CONCURRENCY_RETRIEVAL=4
-
-# ==================== 缓存控制 ====================
-CLEAR_CACHE_ON_START=false
-```
-
----
-
-## 数据格式
-
-### 输入：`data/calls.jsonl`
-
-每行一个 JSON 对象：
-
-```json
-{
-  "call_id": "SIM-M1-UNEMP-001",
-  "text": "催收员：喂，您好，招商银行信用卡中心，请问是张先生吗？；客户：是，你好。；...",
-  "calldate": "20260512",
-  "custno": "0101000001",
-  "colluserid": "SX90001",
-  "mobtyp": "M1",
-  "talktime": "286"
-}
-```
-
-**支持格式**：
-- `.jsonl`：每行一个 JSON（推荐，10 万通首选）
-- `.json`：顶层数组 `[...]` 或包装对象 `{"calls": [...]}`
-
-### 解析后：`output/parsed_calls.jsonl`
-
-```json
-{
-  "call_id": "SIM-M1-UNEMP-001",
-  "turns": [
-    {"turn_id": 0, "role": "催收员", "text": "喂，您好，招商银行信用卡中心，请问是张先生吗？"},
-    {"turn_id": 1, "role": "客户", "text": "是，你好。"}
-  ],
-  "mobtyp": "M1"
-}
-```
-
----
-
-## 使用指南
-
-### 命令行参数
-
-```bash
-python main.py --mode offline    # 仅离线
-python main.py --mode online     # 仅在线
-python main.py --mode all        # 全流程（默认）
-```
-
-### 离线流程（8 个阶段）
-
-| 阶段 | 内容 | 产物 |
-|------|------|------|
-| 1 | 加载并解析会话 | `parsed_calls.jsonl` |
-| 2a | Session 级 LLM 打标 | `session_labels.jsonl` |
-| 2b | Pair 级 LLM 打标 | `pair_labels.jsonl` |
-| 3 | 配置优化 | `optimized_config.json` |
-| 4 | BERTopic 聚类 | `bertopic_model/` |
-| 5 | QA 抽取与去重 | `qa_pairs.json` |
-| 6 | SOP 图谱构建 | `sop_graph.json` |
-| 7 | 向量索引构建 | `faiss/` |
-| 8 | 测试集构建 | `testset.jsonl` |
-
-### 在线流程
-
-```
-ASR 文本 → StateTracker → 四路召回 → RRF 融合 → Top-3
-```
-
-**四路召回**：
-
-| 路 | 说明 | 延迟 |
-|----|------|------|
-| `topic` | BERTopic 主题匹配 | ~100ms |
-| `vector` | Faiss 语义检索 | ~30ms |
-| `label` | 标签向量检索 | ~30ms |
-| `graph` | SOP 图谱节点召回 | <5ms |
-
----
-
-## 核心配置
-
-### `config.py`（人工基线）
-
-包含 7 大 SOP 阶段、种子词、意图关键词、跳转表、候选清单：
+5. 编程接口
 
 ```python
-SOP_STAGES = [
-    "专业开场及身份核实",
-    "欠款事实确认及情况交互",
-    "充分施压",
-    "方案策略与协商",
-    "失败联系及线索管理",
-    "承诺还款闭环",
-    "外呼授权设计",
-]
+from app.online import suggest_script_for_conversation
 
-SEED_TOPIC_LIST = [...]         # BERTopic 种子
-SEED_WORDS = [...]              # 全局领域词
-INTENT_KEYWORDS = {...}         # 在线意图匹配
-EMOTION_KEYWORDS = {...}        # 在线情绪匹配
-TRANSITION_TABLE = {...}        # SOP 跳转表
-SESSION_REASONS = [...]         # Session 级候选
-PAIR_INTENTS = [...]            # Pair 级候选
+text = (
+    "催收员：您好，请问是张先生吗？\n"
+    "客户：是我。\n"
+    "催收员：您名下信用卡本期逾期1900元，请问能处理吗？\n"
+    "客户：我最近被裁员了，暂时没有收入。"
+)
+
+# 方式一：带 stage hint（快速通道）
+res = suggest_script_for_conversation(text, stage_hint="04 方案协商与签署")
+print(res["script"], res["stage"], res["intent"], res["score"])
+
+# 方式二：自动推断（两趟检索）
+res = suggest_script_for_conversation(text)
+
+# 方式三：只要话术字符串
+from app.online import suggest_script
+print(suggest_script(text))
 ```
 
-### `prompts.yaml`（LLM 模板）
+返回值结构：
 
-`session_prompt` 与 `pair_prompt` 两个模板，占位符由 `PromptLoader` 从 `config.py` 注入：
-
-```yaml
-session_prompt: |
-  ...
-  reason_for_delinquency 候选：{session_reasons}
-  ...
-
-pair_prompt: |
-  ...
-  customer_intents 候选：{pair_intents}
-  ...
-```
-
-**设计原则**：
-- 候选清单只在 `config.py` 定义一次
-- `prompts.yaml` 只写模板
-- `PromptLoader` 负责两者合成
-
----
-
-## VS Code 调试
-
-### 调试配置
-
-| 配置名 | 用途 |
-|--------|------|
-| `Main: 全流程 (offline + online)` | 端到端调试 |
-| `Main: 仅离线` | 离线流程 |
-| `Main: 仅在线` | 在线推荐 |
-| `Evaluate: 评测` | 运行评测 |
-| `Offline: 单步调试` | 在 offline.py 打断点 |
-| `Online: 单步调试` | 在 online.py 打断点 |
-
-### 常用任务（`Ctrl+Shift+P` → `Tasks: Run Task`）
-
-| 任务 | 说明 |
-|------|------|
-| `Setup: 创建虚拟环境` | 初始化 .venv |
-| `Setup: 安装依赖` | pip install -r requirements.txt |
-| `Check: 环境自检` | 校验 .env 与路径 |
-| `Log: 实时查看日志` | tail -f log/cca.log |
-| `Clean: 清理输出与缓存` | 重置 output 与 cache |
-
-### 开关 DEBUG 日志
-
-```bash
-# .env
-LOG_LEVEL=DEBUG
-```
-
-或临时覆盖：
-
-```bash
-LOG_LEVEL=DEBUG python main.py --mode online
-```
-
----
-
-## 输出产物
-
-### `output/session_labels.jsonl`
-
-每通会话一条：
-
-```json
+```python
 {
-  "call_id": "SIM-M1-UNEMP-001",
-  "session_summary": "客户因失业无力还款，最终承诺凑款次日还款",
-  "ptp": true,
-  "sop_stages": [
-    {"stage_name": "专业开场及身份核实", "turn_start": 0, "turn_end": 1},
-    {"stage_name": "欠款事实确认及情况交互", "turn_start": 2, "turn_end": 5}
-  ],
-  "reason_for_delinquency": ["失业"],
-  "agent_tactics": ["同理心安抚", "引导分期", "锁定PTP"],
-  "customer_objections": ["失业", "要求减免"],
-  "compliance_checkpoints": ["本人身份确认完成", "隐私合规披露"],
-  "final_outcomes": ["全额承诺还款(PTP)"]
-}
-```
-
-### `output/pair_labels.jsonl`
-
-每个 QA 对一条：
-
-```json
-{
-  "call_id": "SIM-M1-UNEMP-001",
-  "q_idx": 3,
-  "a_idx": 4,
-  "stage": "欠款事实确认及情况交互",
-  "customer_intents": ["经济困难"],
-  "agent_actions": ["同理心安抚", "引导分期"],
-  "keywords": ["还款金额", "短期延期"],
-  "tags": ["情绪平稳", "有还款意愿"],
-  "risk": "None"
-}
-```
-
-### `output/sop_graph.json`
-
-```json
-{
-  "nodes": {
-    "专业开场及身份核实": {
-      "type": "SOP阶段",
-      "order": 0,
-      "intents": ["本人确认", "不是本人", "在忙"],
-      "slots": ["身份信息", "录音告知"],
-      "scripts": [...]
-    }
-  },
-  "edges": [
-    {"source": "专业开场及身份核实", "target": "欠款事实确认及情况交互",
-     "type": "意图跳转", "intent": "本人确认"}
-  ]
+    "script":     "客户：...",           # 推荐话术（主）
+    "question":   "客户：...",           # 对应参考客户问句
+    "stage":      "04 方案协商与签署",   # 推断的 SOP 阶段
+    "intent":     "PLAN_INSTALL",       # 推断的客户意图
+    "source":     "golden" | "pgvector",
+    "score":      0.8734,
+    "alternates": [ {"question": "...", "answer": "...", "score": 0.82, "source": "pgvector"}, ... ],
+    "reject":     False,
+    "latency_ms": 34.2,
+    "debug":      {"mode": "guide", "path": "hint", "passes": 1, ...}
 }
 ```
 
 ---
 
-## 性能指标
+使用方式
 
-### 离线
-
-| 指标 | 目标 | 实测 |
-|------|------|------|
-| LLM 打标吞吐 | ≥ 500 条/分钟 | ~800 条/分钟（16 并发） |
-| 10 万通打标耗时 | < 4 小时 | ~2.5 小时 |
-| BERTopic 拟合 | < 10 分钟 | ~5 分钟 |
-| 全流程 | < 6 小时 | ~4 小时 |
-
-### 在线
-
-| 指标 | 目标 | 实测 |
-|------|------|------|
-| P50 延迟 | < 200ms | ~180ms |
-| P95 延迟 | < 500ms | ~350ms |
-| P99 延迟 | < 800ms | ~500ms |
-| 单机 QPS | > 50 | ~80 |
-
-### 效果
-
-| 指标 | 目标 |
-|------|------|
-| 意图匹配准确率 | ≥ 75% |
-| Recall@3 | ≥ 60% |
-| 合规拦截率 | 100% |
-| PTP 提升 | ≥ 10% |
-
----
-
-## 常见问题
-
-### Q1: `ImportError: cannot import name 'StaticEmbedding'`
-
-**原因**：`sentence-transformers` 版本过旧。
-
-**解决**：
+CLI
 
 ```bash
-pip install --upgrade "sentence-transformers>=3.0.0"
+# 离线建库
+python main.py --mode offline
+
+# 在线演示
+python main.py --mode online
 ```
 
-### Q2: `No prediction data was generated`
+关键配置项（.env）
 
-**原因**：训练数据量过少（< 100 条），或 HDBSCAN 未启用 `prediction_data=True`。
+变量 默认值 说明
+EMBEDDING_MODE local local（本地模型） / tei（远程 HTTP）
+EMBEDDING_BACKEND auto auto / npu / cuda / cpu；auto 优先级 NPU→CUDA→CPU
+EMBEDDING_NUM_GPUS 0 0 = 当前后端内所有可见加速器
+EMBEDDING_BATCH_SIZE 32 单卡 forward batch（local）或 HTTP 请求 chunk（tei）
+EMBEDDING_QUEUE_TIMEOUT 300 设备令牌获取超时（秒）
+STATE_MACHINE_MODE guide off / guide / enforce
+HYBRID_MAX_HOPS 2 图 BFS 最大跳数
+DB_WRITE_BATCH_SIZE 500 每批写库条数
+USE_EMBEDDED_DB true true 用 pgembed；false 用外部 PG
+CLEAR_CACHE_ON_START false true 则清空 cache/、output/、qa_pairs
 
-**解决**：
-- 确保训练数据 ≥ 100 条
-- `offline.py` 中 HDBSCAN 加 `prediction_data=True`
+完整配置见 app/settings.py 与 .env.example。
 
-### Q3: BERTopic 主题数少于 SOP 阶段数
+三种检索模式
 
-**原因**：语料不足或语义区分度低。
+模式 行为 适用场景
+off 无约束 pgvector 检索 冷启动 / 数据探索
+guide 图引导，允许跨 stage 跳转，失败时回退 pass 1 生产默认
+enforce 锁定 hint 或 pass-1 推断的 stage，任何失败硬拒绝 合规严格场景
 
-**解决**：
-- 降低 `BERTOPIC_MIN_TOPIC_SIZE`（如 10）
-- 降低 `BERTOPIC_HDBSCAN_MIN_SIZE`（如 5）
-- 增加训练语料（`CONFIG_MIN_QUALITY_SCORE` 降到 0.5）
+---
 
-### Q4: `.env` 未生效
+目录结构
 
-**排查**：
+```
+.
+├── app/
+│   ├── settings.py           # Pydantic Settings（.env 加载）
+│   ├── logger.py             # 日志
+│   ├── config.py             # SOP 阶段/意图/转移静态定义
+│   ├── llm.py                # LLMClient（OpenAI 兼容）
+│   ├── utils.py              # DB / Embedder / 对话解析 / 并发工具
+│   ├── offline.py            # LLMLabeler / PgvectorWriter / GoldenScriptGenerator
+│   └── online.py             # HybridRetriever / suggest_script*
+├── data/
+│   ├── calls.jsonl           # 历史通话（输入）
+│   └── demo_text.txt         # 演示对话
+├── output/                   # 离线产物（自动创建）
+│   ├── session_labels.jsonl
+│   ├── pair_labels.jsonl
+│   └── sop_graph.json
+├── cache/                    # 嵌入缓存 & 嵌入式 PG 数据目录
+├── log/
+├── prompts.yaml              # LLM prompt 模板
+├── main.py                   # CLI 入口
+├── requirements.txt          # 通用依赖
+├── requirements-npu.txt      # NPU 节点专属依赖
+└── .env.example
+```
+
+---
+
+硬件后端
+
+Local 模式（多加速器数据并行）
+
+```
+每设备 1 份模型副本
+       │
+       ▼
+ThreadPoolExecutor(max_workers=N)
+       │  +  device 令牌队列（每卡同一时刻至多 1 个 encode）
+       ▼
+长度排序切 chunk ──► 并发 encode ──► 按原索引重组 ──► 统一 L2 归一化
+```
+
+CUDA：
+
+```dotenv
+EMBEDDING_BACKEND=cuda
+EMBEDDING_NUM_GPUS=0                    # 用全部可见 GPU
+CUDA_VISIBLE_DEVICES=0,1,2,3
+```
+
+Ascend NPU：
+
+```dotenv
+EMBEDDING_BACKEND=npu
+EMBEDDING_NUM_GPUS=0                    # 用全部可见 NPU
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+```
+
+TEI 模式（远程 HTTP）
 
 ```bash
-# 检查优先级：环境变量 > .env > 代码默认值
-echo $LLM_API_KEY   # 若 shell 已设置，会覆盖 .env
-python -c "from settings import get_settings; print(get_settings().llm_api_key)"
+# 服务端
+text-embeddings-router --model-id BAAI/bge-base-zh-v1.5 --port 8080
 ```
 
-### Q5: WSL 内存不足
-
-**解决**：在 Windows 创建 `C:\Users\<用户名>\.wslconfig`：
-
-```ini
-[wsl2]
-memory=16GB
-processors=8
-swap=8GB
+```dotenv
+EMBEDDING_MODE=tei
+EMBEDDING_TEI_URL=http://localhost:8080
+EMBEDDING_TEI_BATCH_SIZE=32
+EMBEDDING_TEI_CONCURRENCY=8
 ```
 
-### Q6: 日志目录写成 `logs/`
-
-**原因**：旧版本残留。
-
-**解决**：检查 `settings.py` 中 `log_dir="./log"`（单数）。
+同一离线/在线阶段必须使用同一模型，否则向量不可比。
 
 ---
 
-## 技术栈
+性能调优
 
-| 模块 | 技术 | 版本 |
-|------|------|------|
-| LLM | OpenAI / 兼容 API | ≥ 1.0.0 |
-| 主题建模 | BERTopic | ≥ 0.16.0 |
-| Embedding | sentence-transformers | ≥ 3.0.0 |
-| 降维 | UMAP | ≥ 0.5.0 |
-| 聚类 | HDBSCAN | ≥ 0.8.0 |
-| 向量检索 | Faiss (CPU) | ≥ 1.7.4 |
-| 中文分词 | jieba | ≥ 0.42.1 |
-| 配置 | pydantic-settings | ≥ 2.0.0 |
-| 日志 | loguru | ≥ 0.7.0 |
-| 进度条 | tqdm | ≥ 4.65.0 |
-| 环境变量 | python-dotenv | ≥ 1.0.0 |
+参数 影响 建议
+DB_WRITE_BATCH_SIZE 单次写库条数 建议 ≥ embedding_batch_size × 加速器数 × 4
+EMBEDDING_BATCH_SIZE 单卡 forward 大小 显存/内存受限时降低；GPU 上调至 64–128
+EMBEDDING_SORT_BY_LENGTH padding 浪费 保持 true
+HYBRID_PG_TOP_K 向量检索深度 20 → 50 提升召回，延迟 ×1.5
+HYBRID_MAX_HOPS 图 BFS 半径 2 平衡召回与噪声；严格场景降至 1
+EMBED_CACHE_SIZE 在线 embedding 缓存 高频相似 query 场景提高至 5000+
 
----
+参考吞吐（BGE-base，4×A100，batch=32）：
 
-## 核心设计原则
-
-1. **零训练**：BERTopic 无监督，无需标注与训练
-2. **配置单一真理源**：`config.py` 定义所有候选清单，`prompts.yaml` 只写模板
-3. **离线重、在线轻**：所有 LLM 推理离线完成，在线只做检索与排序
-4. **多路融合**：主题 + 向量 + 标签 + 图谱，RRF 融合，覆盖更全
-5. **降级兜底**：任一路召回失败不影响整体，合规硬过滤始终生效
-6. **可解释**：每条推荐有 SOP 节点、意图、召回来源三重依据
-7. **闭环迭代**：反馈回收 → 配置优化 → 图谱更新 → 模型微调
+场景 吞吐
+单卡 CPU（16 核） ~30 q/s
+单卡 A100 ~600 q/s
+4×A100 数据并行 ~2200 q/s
 
 ---
 
-## 许可
+故障排查
 
-Internal use only.
+启动类
+
+现象 排查
+ImportError: torch_npu 检查 pip list \| grep torch，torch 与 torch_npu 版本必须严格匹配
+npu-smi 显示设备但 torch.npu.is_available() 为 False 未 source CANN 环境或驱动不匹配，执行 source /usr/local/Ascend/ascend-toolkit/set_env.sh
+pgembed 启动失败 检查 cache/local_pgdata 目录权限；首次启动可能需要 ulimit -n 65535
+
+运行类
+
+现象 排查
+SOP 图谱未找到 ... 先执行 python main.py --mode offline
+获取设备令牌超时 有 worker 未正常归还设备，检查是否有超长 encode 或进程被 SIGSTOP；临时提高 EMBEDDING_QUEUE_TIMEOUT
+手动 HF 推理兜底 频繁触发 sentence-transformers 在 NPU 上的 encode() 异常；升级 ST 至最新版或固定 EMBEDDING_BACKEND=cuda
+cosine(normal, manual) < 0.9999 pooling 语义不一致，检查 1_Pooling/config.json 中的 pooling_mode_*
+在线结果与离线预期不符 检查离线/在线是否使用同一 embedding 模型和同一后端
+
+调试工具
+
+```bash
+# 检查环境
+python3 -c "import torch, torch_npu; print(torch.__version__, torch_npu.__version__, torch.npu.is_available())"
+
+# 检查 embedding 一致性（NPU）
+python3 -c "
+import numpy as np, torch
+from sentence_transformers import SentenceTransformer
+m = SentenceTransformer('BAAI/bge-base-zh-v1.5', device='npu:0')
+a = m.encode(['测试'], normalize_embeddings=True, convert_to_numpy=True)
+tok = m.tokenizer
+enc = {k: v.to('npu:0') for k, v in tok(['测试'], padding=True, return_tensors='pt').items()}
+with torch.no_grad():
+    out = m[0].auto_model(**enc)
+    p = m.pooling({'token_embeddings': out.last_hidden_state, 'attention_mask': enc['attention_mask']})['sentence_embedding'].cpu().numpy()
+p /= np.linalg.norm(p, axis=1, keepdims=True)
+print('cosine:', float((a*p).sum()))
+"
+
+# 清空全部状态重来
+CLEAR_CACHE_ON_START=true python main.py --mode offline
+```
 
 ---
 
-## 联系方式
+开发与测试
 
-- 项目负责人：[填写]
-- 技术支持：[填写]
-- 问题反馈：[填写]
+```bash
+# 静态检查
+ruff check app/
+
+# 单元测试（embedder / 对话解析）
+pytest tests/ -v
+
+# 快速回归：仅验证核心 API
+python -c "
+from app.online import suggest_script_for_conversation
+r = suggest_script_for_conversation('客户：我最近被裁员了。', stage_hint='04 方案协商与签署')
+assert r['script'] and not r['reject']
+print('OK:', r['latency_ms'], 'ms')
+"
+```
+
+---
+
+License
+
+内部项目，未公开发布。使用前请联系项目维护者。
