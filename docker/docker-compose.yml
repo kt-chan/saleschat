@@ -45,7 +45,6 @@ services:
       - ../output:/app/output
       - ../log:/app/log
       - ../models:/app/models
-      - ../testllm.py:/app/testllm.py
     depends_on:
       db:
         condition: service_healthy

@@ -1,19 +1,22 @@
 # syntax=docker/dockerfile:1.7
 #
 # 双目标 Dockerfile：
-#   --target nvidia  → linux/amd64，NVIDIA (sm_86) + CUDA 12.8 + Python 3.12
-#   --target ascend  → linux/arm64，昇腾 310P + 官方预打包 CANN 9.1.0 (或 8.5.0) + openEuler 24.03 + Python 3.12
+#   --target nvidia  → linux/amd64，NVIDIA (sm_86+) + CUDA 12.8 + Python 3.12
+#   --target ascend  → linux/arm64，昇腾 310P + CANN 9.1.0 + openEuler 24.03 + Python 3.12
 #
-# 两个 target 都安装了 GPU/NPU 运行时；如果运行环境无卡，应用会回退 CPU。
-# 构建期 smoke test 只验证「软件栈完整 + 无卡回退 CPU + CPU 推理」，不做真实加速器推理。
+# 版本配套（ascend）：
+#   torch 2.10.0+cpu  ↔  torch_npu 2.10.0.post4  ↔  CANN 9.1.0  ↔  Python 3.12
+#
+# 两个 target 都安装了加速器运行时；无卡环境会回退 CPU。
+# 构建期 smoke test 验证软件栈完整性 + CPU 推理可用性，不做真实加速器推理。
 
 ARG PYTHON_VERSION=3.12
-ARG TORCH_VERSION=2.8.0
-ARG TORCHVISION_VERSION=0.23.0
-ARG TORCHAUDIO_VERSION=2.8.0
-ARG TORCH_NPU_VERSION=2.8.0
+ARG TORCH_VERSION=2.10.0
+ARG TORCHVISION_VERSION=0.25.0
+ARG TORCHAUDIO_VERSION=2.10.0
+ARG TORCH_NPU_VERSION=2.10.0.post4
 
-# 基础镜像标签定义
+# 基础镜像标签
 ARG CUDA_IMAGE=nvidia/cuda:12.8.0-runtime-ubuntu22.04
 ARG CANN_IMAGE=quay.io/ascend/cann:9.1.0-310p-openeuler24.03-py3.12
 
@@ -57,22 +60,23 @@ RUN python${PYTHON_VERSION} -m venv /opt/venv \
 WORKDIR /app
 COPY requirements.txt .
 
+# torch 家族从 cu128 索引安装（与 CUDA 12.8 运行时匹配）
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir \
+    pip install \
         torch==${TORCH_VERSION} \
         torchvision==${TORCHVISION_VERSION} \
         torchaudio==${TORCHAUDIO_VERSION} \
         --index-url https://download.pytorch.org/whl/cu128
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -r requirements.txt
+    pip install -r requirements.txt
 
 COPY docker/models.txt docker/download_models.sh ./docker/
 RUN --mount=type=secret,id=HF_TOKEN,required=false \
     chmod +x ./docker/download_models.sh \
     && ./docker/download_models.sh docker/models.txt
 
-# 显式使用 /opt/venv/bin/python 执行测试
+# Smoke test：CUDA 链接 + CPU fallback 推理
 RUN /opt/venv/bin/python - <<'PY'
 import os, ctypes, torch
 from pathlib import Path
@@ -111,10 +115,9 @@ CMD ["python", "main.py", "--mode", "offline"]
 
 # ============================================================
 # Target: ascend  (linux/arm64)
-# 基础镜像：官方预打包 CANN + openEuler 24.03 + Python 3.12
+# 基础镜像：官方预打包 CANN 9.1.0 + openEuler 24.03 + Python 3.12
 # ============================================================
 FROM ${CANN_IMAGE} AS ascend
-
 ARG TORCH_VERSION
 ARG TORCH_NPU_VERSION
 
@@ -128,22 +131,62 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /app
 COPY requirements.txt .
 
-# 官方预打包镜像已自带 Python 3.12 运行时，直接通过 pip 安装 CPU 端 PyTorch 与配套的 torch_npu
+# torch CPU 版 + torch_npu 2.10.0.post4
+# 注意：torch_npu 必须通过华为云 Ascend PyPI 镜像安装，不能从 PyPI 默认源拿
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir \
+    pip install \
         torch==${TORCH_VERSION}+cpu \
         --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir \
-        https://gitcode.com/Ascend/pytorch/releases/download/v7.3.0-pytorch2.8.0/torch_npu-2.8.0.post2-cp312-cp312-manylinux_2_28_aarch64.whl
+    && pip install \
+        torch_npu==${TORCH_NPU_VERSION} \
+        --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
+        --index-strategy unsafe-best-match
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -r requirements.txt
+    pip install -r requirements.txt
 
 COPY docker/models.txt docker/download_models.sh ./docker/
 RUN --mount=type=secret,id=HF_TOKEN,required=false \
     chmod +x ./docker/download_models.sh \
     && ./docker/download_models.sh docker/models.txt
 
+# Smoke test：torch_npu 导入 + CANN 环境 + CPU fallback 推理
+RUN python - <<'PY'
+import os, sys
+import torch
+
+print(f"torch: {torch.__version__}")
+assert "+cpu" in torch.__version__, "ascend target must use torch CPU build"
+
+try:
+    import torch_npu
+    print(f"torch_npu: {torch_npu.__version__}")
+    print(f"npu.is_available(): {torch.npu.is_available()}")
+except ImportError as e:
+    print(f"FATAL: torch_npu import failed: {e}")
+    sys.exit(1)
+
+# CANN 环境完整性（只在 toolkit 存在时校验）
+ascend_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
+if os.path.isdir(ascend_home):
+    print(f"ASCEND_HOME_PATH: {ascend_home} (present)")
+else:
+    print(f"WARNING: {ascend_home} not found — CANN runtime may be incomplete")
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+from sentence_transformers import SentenceTransformer
+from pathlib import Path
+
+first = next(
+    l.split("#", 1)[0].strip()
+    for l in Path("docker/models.txt").read_text().splitlines()
+    if l.split("#", 1)[0].strip()
+)
+model = SentenceTransformer(first, device="cpu")
+vec = model.encode(["offline smoke test"], normalize_embeddings=True)
+print(f"smoke ok (cpu fallback): {first}, dim={vec.shape[-1]}")
+PY
 
 COPY . .
 RUN rm -f .env .env.* && rm -rf data output log cache docker

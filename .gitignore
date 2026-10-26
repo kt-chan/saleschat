@@ -26,6 +26,7 @@ venv/
 env/
 ENV/
 .python-version
+.crictl
 
 # ---------- Testing / Coverage ----------
 .pytest_cache/

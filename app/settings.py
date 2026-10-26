@@ -18,11 +18,32 @@ class Settings(BaseSettings):
     llm_temperature_labeling: float = 0.1
     llm_temperature_synthesis: float = 0.3
 
-    # Embedding
+    # Embedding (common)
     embedding_model: str = "BAAI/bge-base-zh-v1.5"
-    embedding_device: str = "cpu"
-    embedding_batch_size: int = 256
+    embedding_batch_size: int = 32
     embed_cache_size: int = 2000
+    embedding_sort_by_length: bool = True
+
+    # Embedding — 异构后端选择
+    # "auto" = NPU 优先 → CUDA → CPU；也可显式指定 "npu" / "cuda" / "cpu"
+    embedding_backend: str = "auto"
+    embedding_num_gpus: int = 0          # 0 = 当前后端内所有可见加速器
+    embedding_device: str = "auto"       # 兼容保留；实际后端由 embedding_backend 决定
+
+    # Embedding — 本地并发 / 容错
+    embedding_retry_max: int = 3         # 单个 chunk 编码失败重试次数
+    embedding_retry_backoff: float = 1.5 # 重试退避底数（秒）
+    embedding_queue_timeout: int = 300   # 获取设备令牌的超时（秒），防止死锁
+
+    # Embedding — 远程 TEI
+    embedding_mode: str = "local"        # "local" | "tei"
+    embedding_tei_url: str = ""
+    embedding_tei_timeout: int = 30
+    embedding_tei_batch_size: int = 32
+    embedding_tei_concurrency: int = 8
+    embedding_tei_retry_max: int = 3
+    embedding_tei_retry_backoff: float = 2.0
+    embedding_tei_truncate: bool = True
 
     # Dialog parsing
     dialog_parse_mode: str = "auto"
@@ -37,7 +58,6 @@ class Settings(BaseSettings):
     dialog_customer_role: str = "客户"
     dialog_agent_role: str = "催收员"
 
-    # Rewrite prefixes
     prompt_customer_prefix: str = "客户："
     prompt_agent_prefix: str = "催收员："
 

@@ -7,7 +7,18 @@ from app.logger import get_logger
 from app.utils import init_db, clear_system_data, parse_dialog
 from app.offline import load_calls, LLMLabeler, PgvectorWriter, GoldenScriptGenerator
 from app.online import HybridRetriever, get_retriever, suggest_script_for_conversation
+from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_env_path = PROJECT_ROOT / ".env"
+
+if _env_path.is_file():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_path)          # override=False: YAML envs: still win
+    except ImportError:
+        pass                            # offline image without python-dotenv
+    
 log = get_logger(__name__)
 retriever: Optional[HybridRetriever] = None
 
