@@ -144,11 +144,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 #    - 使用 curl -fL: -f 使 4xx/5xx 报错退出, -L 跟随重定向
 RUN set -eux; \
     TORCH_NPU_URL="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/torch_npu-${TORCH_NPU_VERSION}-cp312-cp312-manylinux_2_28_aarch64.whl"; \
-    echo "Downloading torch_npu from: ${TORCH_NPU_URL}"; \
+    WHL="$(basename "${TORCH_NPU_URL}")"; \
+    echo "Downloading ${WHL}"; \
     curl -fL --retry 5 --retry-delay 3 --connect-timeout 30 \
-        "${TORCH_NPU_URL}" -o /tmp/torch_npu.whl; \
-    pip install --no-cache-dir /tmp/torch_npu.whl; \
-    rm -f /tmp/torch_npu.whl
+        "${TORCH_NPU_URL}" -o "/tmp/${WHL}"; \
+    pip install --no-cache-dir "/tmp/${WHL}"; \
+    rm -f "/tmp/${WHL}"
 
 # 3) 验证 torch_npu 可导入
 RUN python -c "import torch, torch_npu; print(f'torch: {torch.__version__}, torch_npu: {torch_npu.__version__}')"
