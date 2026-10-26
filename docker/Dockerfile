@@ -5,7 +5,9 @@
 #   --target ascend  → linux/arm64，昇腾 310P + CANN 9.1.0 + openEuler 24.03 + Python 3.12
 #
 # 版本配套（ascend）：
-#   torch 2.10.0+cpu  ↔  torch_npu 2.10.0.post4  ↔  CANN 9.1.0  ↔  Python 3.12
+#   torch 2.10.0+cpu  ↔  torch_npu 2.10.0  ↔  CANN 9.1.0  ↔  Python 3.12
+#   wheel: torch_npu-2.10.0-cp312-cp312-manylinux_2_28_aarch64.whl
+#   来源: https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/
 #
 # 两个 target 都安装了加速器运行时；无卡环境会回退 CPU。
 # 构建期 smoke test 验证软件栈完整性 + CPU 推理可用性，不做真实加速器推理。
@@ -14,7 +16,7 @@ ARG PYTHON_VERSION=3.12
 ARG TORCH_VERSION=2.10.0
 ARG TORCHVISION_VERSION=0.25.0
 ARG TORCHAUDIO_VERSION=2.10.0
-ARG TORCH_NPU_VERSION=2.10.0.post4
+ARG TORCH_NPU_VERSION=2.10.0
 
 # 基础镜像标签
 ARG CUDA_IMAGE=nvidia/cuda:12.8.0-runtime-ubuntu22.04
@@ -60,7 +62,7 @@ RUN python${PYTHON_VERSION} -m venv /opt/venv \
 WORKDIR /app
 COPY requirements.txt .
 
-# torch 家族从 cu128 索引安装（与 CUDA 12.8 运行时匹配）
+# torch 家族从 cu128 索引安装（与 CUDA 12.8 runtime 匹配）
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
         torch==${TORCH_VERSION} \
@@ -131,17 +133,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /app
 COPY requirements.txt .
 
-# torch CPU 版 + torch_npu 2.10.0.post4
-# 注意：torch_npu 必须通过华为云 Ascend PyPI 镜像安装，不能从 PyPI 默认源拿
+# 1) torch CPU 版本（2.10.0 系列的 +cpu wheel 仅在 PyTorch 官方 CPU 源提供）
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
-        torch==${TORCH_VERSION}+cpu \
-        --index-url https://download.pytorch.org/whl/cpu \
-    && pip install \
-        torch_npu==${TORCH_NPU_VERSION} \
-        --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
-        --index-strategy unsafe-best-match
+    pip install torch==${TORCH_VERSION}+cpu \
+        --index-url https://download.pytorch.org/whl/cpu
 
+# 2) 从 GitCode Release 下载并安装 torch_npu（aarch64 wheel）
+#    - 标签: v26.0.0-pytorch2.10.0
+#    - 文件: torch_npu-2.10.0-cp312-cp312-manylinux_2_28_aarch64.whl
+#    - 使用 curl -fL: -f 使 4xx/5xx 报错退出, -L 跟随重定向
+RUN set -eux; \
+    TORCH_NPU_URL="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/torch_npu-${TORCH_NPU_VERSION}-cp312-cp312-manylinux_2_28_aarch64.whl"; \
+    echo "Downloading torch_npu from: ${TORCH_NPU_URL}"; \
+    curl -fL --retry 5 --retry-delay 3 --connect-timeout 30 \
+        "${TORCH_NPU_URL}" -o /tmp/torch_npu.whl; \
+    pip install --no-cache-dir /tmp/torch_npu.whl; \
+    rm -f /tmp/torch_npu.whl
+
+# 3) 验证 torch_npu 可导入
+RUN python -c "import torch, torch_npu; print(f'torch: {torch.__version__}, torch_npu: {torch_npu.__version__}')"
+
+# 4) 安装项目其余依赖
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 
@@ -150,24 +162,20 @@ RUN --mount=type=secret,id=HF_TOKEN,required=false \
     chmod +x ./docker/download_models.sh \
     && ./docker/download_models.sh docker/models.txt
 
-# Smoke test：torch_npu 导入 + CANN 环境 + CPU fallback 推理
+# 5) Smoke test：torch_npu 导入 + NPU 可用性探测 + CPU fallback 推理
 RUN python - <<'PY'
-import os, sys
-import torch
+import os, torch
 
 print(f"torch: {torch.__version__}")
 assert "+cpu" in torch.__version__, "ascend target must use torch CPU build"
 
-try:
-    import torch_npu
-    print(f"torch_npu: {torch_npu.__version__}")
-    print(f"npu.is_available(): {torch.npu.is_available()}")
-except ImportError as e:
-    print(f"FATAL: torch_npu import failed: {e}")
-    sys.exit(1)
+import torch_npu
+print(f"torch_npu: {torch_npu.__version__}")
+print(f"npu.is_available(): {torch.npu.is_available()}")
 
-# CANN 环境完整性（只在 toolkit 存在时校验）
-ascend_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
+ascend_home = os.environ.get(
+    "ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"
+)
 if os.path.isdir(ascend_home):
     print(f"ASCEND_HOME_PATH: {ascend_home} (present)")
 else:
