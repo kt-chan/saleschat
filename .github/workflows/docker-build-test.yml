@@ -72,7 +72,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           outputs: |
             type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-            type=docker,dest=py311-base-${{ matrix.arch_suffix }}.tar
+            type=docker,dest=py311-base-${{ matrix.arch_suffix }}.tar,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.arch_suffix }}
           cache-from: type=gha,scope=build-${{ matrix.arch_suffix }}-v1
           cache-to: type=gha,mode=max,scope=build-${{ matrix.arch_suffix }}-v1
           provenance: false
