@@ -130,7 +130,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     TOKENIZERS_PARALLELISM=false \
     ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest \
-    LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/$(uname -m)-linux/devlib:$LD_LIBRARY_PATH \
+    LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/devlib \
     TORCH_DEVICE_BACKEND_AUTOLOAD=1
 
 WORKDIR /app
