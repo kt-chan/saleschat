@@ -74,8 +74,8 @@ jobs:
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
           outputs: |
-  type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-  type=docker,dest=saleschat-${{ matrix.arch_suffix }}.tar,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.arch_suffix }}
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+            type=docker,dest=saleschat-${{ matrix.arch_suffix }}.tar,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.arch_suffix }}
           secrets: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
           cache-from: type=gha,scope=${{ matrix.target }}-v3
