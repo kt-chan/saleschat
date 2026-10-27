@@ -39,13 +39,17 @@ cfg = get_settings()
 
 # ---------------- 数据模型 ----------------
 
+
 class SuggestReq(BaseModel):
     conversation: str = Field(
-        ..., min_length=1, max_length=20_000,
+        ...,
+        min_length=1,
+        max_length=20_000,
         description="整段对话文本，每行以『客户：』/『催收员：』开头",
     )
     stage_hint: Optional[str] = Field(
-        None, max_length=64,
+        None,
+        max_length=64,
         description="可选：当前阶段提示；缺失时由状态机自动推断",
     )
 
@@ -62,11 +66,13 @@ class HealthResp(BaseModel):
 
 # ---------------- 生命周期 ----------------
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPIOffline):
     # ===== startup =====
     t0 = time.time()
     log.info("FastAPI 启动中，预热 retriever ...")
+    log.info("FastAPI Docs running on http://127.0.0.1:8000/docs")
     try:
         get_retriever()
         log.info(f"retriever 预热完成，耗时 {time.time() - t0:.2f}s")
@@ -89,6 +95,7 @@ async def lifespan(app: FastAPIOffline):
     log.info("FastAPI 关闭中 ...")
     try:
         import app.utils as utils
+
         if utils._db_pool is not None:
             utils._db_pool.close()
             utils._db_pool = None
@@ -116,6 +123,7 @@ app = FastAPIOffline(
 
 # ---------------- 统一异常响应 ----------------
 
+
 @app.exception_handler(HTTPException)
 async def _http_exc_handler(request: Request, exc: HTTPException):
     return JSONResponse(
@@ -135,9 +143,44 @@ async def _unhandled_exc_handler(request: Request, exc: Exception):
 
 # ---------------- 端点 ----------------
 
+
 @app.get("/", include_in_schema=False)
 def root():
     return {"service": "催收话术推荐", "docs": "/docs", "health": "/health"}
+
+
+@app.post("/chat", response_model=SuggestResp)
+def chat(req: SuggestReq):
+    """
+    根据对话历史推荐下一句话术。
+
+    响应统一包一层 `{"success": bool, "data": {...}}`：
+      - success=true  → data 为上游原始输出
+      - success=false → data 含 error 与 fallback 话术（保证 HTTP 200，
+                        前端始终能拿到可念给客户的兜底文案）
+    """
+    t0 = time.time()
+    try:
+        result = suggest_script_for_conversation(
+            req.conversation,
+            stage_hint=req.stage_hint,
+        )
+        if not isinstance(result, dict):
+            result = {"result": result}
+        log.info(
+            f"/suggest 完成 耗时={time.time() - t0:.2f}s "
+            f"stage_hint={req.stage_hint} chars={len(req.conversation)}"
+        )
+        return SuggestResp(success=True, data={"script": result["script"]})
+    except Exception as e:
+        log.exception(f"/suggest 失败: {e}")
+        return SuggestResp(
+            success=False,
+            data={
+                "error": str(e),
+                "fallback": cfg.suggest_fallback_script,
+            },
+        )
 
 
 @app.post("/suggest", response_model=SuggestResp)
@@ -153,7 +196,8 @@ def suggest(req: SuggestReq):
     t0 = time.time()
     try:
         result = suggest_script_for_conversation(
-            req.conversation, stage_hint=req.stage_hint,
+            req.conversation,
+            stage_hint=req.stage_hint,
         )
         if not isinstance(result, dict):
             result = {"result": result}
@@ -218,11 +262,12 @@ def health_ready():
 # ---------------- 独立启动 ----------------
 
 if __name__ == "__main__":
+    log.info("FastAPI is starting   ...")
     uvicorn.run(
         "app.server:app",
         host="0.0.0.0",
         port=8000,
-        workers=1,              # 有进程内单例（retriever / DB pool），保持 1
+        workers=1,  # 有进程内单例（retriever / DB pool），保持 1
         log_level="info",
         timeout_keep_alive=30,  # LLM 调用较慢，容忍长连接
     )
