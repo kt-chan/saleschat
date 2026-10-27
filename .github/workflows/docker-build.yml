@@ -23,6 +23,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
+  # 实际文件名是小写 dockerfile
   DOCKERFILE: ./docker/Dockerfile
 
 permissions:
@@ -32,9 +33,8 @@ permissions:
 jobs:
   # ==========================================================
   # 1) 双架构并行构建
-  #    - amd64  → ubuntu-latest (x86_64 原生)
-  #    - arm64  → ubuntu-24.04-arm (aarch64 原生)
-  #    每个 arch 独立推 by-digest + 可选导出本地 tar
+  #    amd64 → ubuntu-latest (x86_64 原生)
+  #    arm64 → ubuntu-24.04-arm (aarch64 原生，避免 QEMU 慢/失败)
   # ==========================================================
   build:
     if: |
@@ -74,7 +74,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ---------- 动态拼接 outputs ----------
       - name: Compose build outputs
         id: outputs
         run: |
@@ -98,7 +97,6 @@ jobs:
           printf "%s" "$LINES" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-      # ---------- 单架构构建（单 arch 的 platform，避免 buildx 内部多平台解码） ----------
       - name: Build ${{ matrix.arch_suffix }}
         id: build
         uses: docker/build-push-action@v6
@@ -107,6 +105,7 @@ jobs:
           file: ${{ env.DOCKERFILE }}
           platforms: ${{ matrix.platform }}
           outputs: ${{ steps.outputs.outputs.OUTPUTS }}
+          # 多阶段构建同样使用 cache，加速第二次以后的构建
           cache-from: type=gha,scope=app-${{ matrix.arch_suffix }}
           cache-to: type=gha,mode=max,scope=app-${{ matrix.arch_suffix }}
           provenance: false
@@ -127,7 +126,7 @@ jobs:
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           if [ -z "$digest" ]; then
-            echo "ERROR: 没有 digest 输出"; exit 1
+            echo "ERROR: 没有 digest 输出，可能未推送"; exit 1
           fi
           echo "${digest#sha256:}" > "/tmp/digests/${{ matrix.arch_suffix }}"
 
@@ -142,8 +141,6 @@ jobs:
 
   # ==========================================================
   # 2) 合并 amd64 + arm64 digests 成多架构 manifest
-  #    产出 ghcr.io/<owner>/<repo>:<semver> 等 tag
-  #    docker pull 会自动选匹配宿主架构的那份
   # ==========================================================
   merge:
     needs: build
@@ -162,10 +159,6 @@ jobs:
       - name: Normalize image name to lowercase
         run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
-      # ---------- 下载两个 arch 的 digest 文件 ----------
-      #   文件内容：
-      #     /tmp/digests/amd64  → sha256:<hex>
-      #     /tmp/digests/arm64  → sha256:<hex>
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
@@ -224,7 +217,6 @@ jobs:
           echo "Inspecting $TAG"
           docker buildx imagetools inspect "$TAG"
 
-      # ---------- 断言 manifest 里确实包含两个平台 ----------
       - name: Assert both platforms in manifest
         run: |
           set -eu
