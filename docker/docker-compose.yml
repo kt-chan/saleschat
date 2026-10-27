@@ -53,12 +53,22 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:89-1.9
     container_name: text-embeddings-inference
     runtime: nvidia
+    environment:
+      HF_HOME: /data
     entrypoint: ["text-embeddings-router"]
     command:
       - "--model-id"
-      - "BAAI/bge-base-zh-v1.5"
-      - "--port"
-      - "80"
+      - "BAAI/bge-base-zh-v1.5"        # 与 .env 的 EMBEDDING_MODEL 对齐（768 维）
+      - "--max-batch-tokens"
+      - "4096"                          # RTX 2000 Ada 8GB，保守取值
+      - "--max-batch-requests"
+      - "8"
+      - "--max-client-batch-size"
+      - "32"                            # 与 EMBEDDING_TEI_BATCH_SIZE 对齐
+      - "--max-concurrent-requests"
+      - "64"
+      - "--tokenization-workers"
+      - "2"
     ports:
       - "8080:80"
     volumes:

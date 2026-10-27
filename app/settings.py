@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     output_dir: str = "./output"
     cache_dir: str = "./cache"
     log_dir: str = "./log"
-    calls_file: str = "./data/calls.jsonl"
+    calls_file_pattern: str = "*.jsonl"
     prompt_file: str = "./prompts.yaml"
     demo_text: str = ""
     demo_text_file: str = "./data/demo_text.txt"

@@ -54,7 +54,7 @@ def offline_pipeline():
     init_db()
 
     log.info("=== 阶段1: 解析原始会话 ===")
-    calls = load_calls(cfg.calls_file)
+    calls = load_calls(cfg.data_dir, cfg.calls_file_pattern)
     if not calls:
         return
 

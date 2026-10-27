@@ -19,31 +19,107 @@ from app.llm import LLMClient, get_llm_client
 
 log = get_logger(__name__)
 
+VALID_SUFFIXES = (".json", ".jsonl")
 
-def load_calls(path: str) -> List[Dict]:
-    p = Path(path)
-    if not p.exists():
-        log.error(f"文件不存在: {path}")
+
+def _read_raw_objs(f: Path) -> List[Dict]:
+    """读取单个 json / jsonl 文件并返回原始对象列表。"""
+    try:
+        if f.suffix.lower() == ".jsonl":
+            objs: List[Dict] = []
+            with open(f, "r", encoding="utf-8") as fh:
+                for lineno, line in enumerate(fh, 1):
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        objs.append(json.loads(s))
+                    except json.JSONDecodeError as e:
+                        log.warning(f"跳过非法行 {f}:{lineno}: {e}")
+            return objs
+        else:  # .json
+            with open(f, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, list) else data.get("calls", [])
+    except Exception as e:
+        log.error(f"解析文件失败 {f}: {e}")
         return []
-    raw_objs: List[Dict] = []
-    if p.suffix.lower() == ".jsonl":
-        with open(p, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    raw_objs.append(json.loads(line.strip()))
-    else:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            raw_objs = data if isinstance(data, list) else data.get("calls", [])
 
-    calls, skipped = [], 0
-    for obj in raw_objs:
-        obj["turns"] = parse_dialog(obj.get("text", ""))
-        if len(obj["turns"]) >= 2:
-            calls.append(obj)
-        else:
-            skipped += 1
-    log.info(f"加载完成: 有效 {len(calls)} 通, 跳过 {skipped} 通")
+
+def _collect_files(
+    p: Path, pattern: Optional[str] = None, recursive: bool = False
+) -> List[Path]:
+    """把 path 归一为文件列表。目录模式下按 pattern（如 part_*.jsonl）过滤。"""
+    if p.is_file():
+        if p.suffix.lower() not in VALID_SUFFIXES:
+            log.warning(f"非 json/jsonl 文件: {p}")
+            return []
+        return [p]
+
+    if p.is_dir():
+        # 有 pattern 用 pattern，否则用通用匹配
+        pats = [pattern] if pattern else ["*.json", "*.jsonl"]
+        it = p.rglob if recursive else p.glob
+        seen: set[Path] = set()
+        files: List[Path] = []
+        for pat in pats:
+            for f in it(pat):
+                if f.is_file() and f.suffix.lower() in VALID_SUFFIXES and f not in seen:
+                    seen.add(f)
+                    files.append(f)
+        files.sort()
+        if not files:
+            log.warning(
+                f"目录下未找到匹配文件: {p} (pattern={pattern or '*.json|*.jsonl'})"
+            )
+        return files
+
+    log.error(f"无效路径: {p}")
+    return []
+
+
+def load_calls(
+    path: Optional[str] = None,
+    pattern: Optional[str] = None,
+    recursive: bool = False,
+) -> List[Dict]:
+    """
+    加载通话数据。支持：
+      - 单个 .json / .jsonl 文件
+      - 目录下多个 .json / .jsonl 文件（默认只扫描一层，recursive=True 递归）
+      - path 为 None 时使用 .env 中的 DATA_DIR
+      - pattern 为 None 时使用 .env 中的 CALLS_FILE_PATTERN（如 part_*.jsonl）
+        pattern 仅对目录生效；未配置时回落到 *.json / *.jsonl
+    """
+    target = path 
+    if not target:
+        log.error("未提供 path 且 .env 中未配置 DATA_DIR")
+        return []
+
+    p = Path(target)
+    if not p.exists():
+        log.error(f"文件/目录不存在: {target}")
+        return []
+
+    files = _collect_files(p, pattern=pattern, recursive=recursive)
+    if not files:
+        return []
+
+    calls: List[Dict] = []
+    skipped = 0
+    for f in files:
+        raw_objs = _read_raw_objs(f)
+        for obj in raw_objs:
+            obj["turns"] = parse_dialog(obj.get("dialog", ""))
+            if len(obj["turns"]) >= 2:
+                calls.append(obj)
+            else:
+                skipped += 1
+
+    log.info(
+        f"加载完成: 有效 {len(calls)} 通, 跳过 {skipped} 通, "
+        f"文件 {len(files)} 个 (来源: {target}, pattern={pattern or '默认'})"
+    )
     return calls
 
 
