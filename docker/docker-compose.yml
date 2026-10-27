@@ -90,7 +90,7 @@ services:
   app:
     build:
       context: ..                       # build context 是项目根（Dockerfile 在那）
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile
     image: cca-app:latest
     container_name: cca-app
     profiles: ["app"]                   # 默认不启动，避免与 F5 调试冲突

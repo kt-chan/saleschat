@@ -52,6 +52,10 @@ RUN apt-get update \
         iproute2 \
         less \
         jq \
+        build-essential \
+        libopenblas-dev \
+        liblapack-dev \
+        gfortran \
     && sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
     && sed -i 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen \
     && locale-gen \
