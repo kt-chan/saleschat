@@ -13,8 +13,10 @@
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONDONTWRITEBYTECODE": "1"
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
       },
+      "preLaunchTask": "Stack: Up",
       "justMyCode": false,
       "python": "${command:python.interpreterPath}"
     },
@@ -30,9 +32,9 @@
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
         "PYTHONUNBUFFERED": "1",
-        "HF_HOME": "./models/huggingface"
-
+        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
       },
+      "preLaunchTask": "Stack: Up",
       "justMyCode": false
     },
     {
@@ -47,10 +49,56 @@
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
         "PYTHONUNBUFFERED": "1",
-        "HF_HOME": "./models/huggingface"
+        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
       },
+      "preLaunchTask": "Stack: Up",
       "justMyCode": false
     },
+
+    // ==================== FastAPI Server ====================
+    {
+      "name": "Server: FastAPI (调试)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app/server.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+      },
+      "preLaunchTask": "Stack: Up",
+      "justMyCode": false
+    },
+    {
+      "name": "Server: FastAPI (热重载，uvicorn --reload)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "app.server:app",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--reload",
+        "--reload-dir", "${workspaceFolder}/app",
+        "--log-level", "info"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "PYTHONUNBUFFERED": "1",
+        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+      },
+      "preLaunchTask": "Stack: Up",
+      "subProcess": true,
+      "justMyCode": false
+    },
+
     {
       "name": "Evaluate: 评测",
       "type": "debugpy",
@@ -61,8 +109,10 @@
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
-        "PYTHONUNBUFFERED": "1"
+        "PYTHONUNBUFFERED": "1",
+        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
       },
+      "preLaunchTask": "Stack: Up",
       "justMyCode": false
     },
     {
@@ -74,8 +124,10 @@
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}"
+        "PYTHONPATH": "${workspaceFolder}",
+        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
       },
+      "preLaunchTask": "Stack: Up",
       "justMyCode": false
     },
     {
@@ -87,8 +139,10 @@
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}"
+        "PYTHONPATH": "${workspaceFolder}",
+        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
       },
+      "preLaunchTask": "Stack: Up",
       "justMyCode": false
     },
     {
@@ -101,8 +155,10 @@
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}"
+        "PYTHONPATH": "${workspaceFolder}",
+        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
       },
+      "preLaunchTask": "Stack: Up",
       "justMyCode": false
     },
     {
@@ -122,9 +178,7 @@
   "compounds": [
     {
       "name": "Compound: 离线后在线",
-      "configurations": [
-        "Main: 仅离线"
-      ],
+      "configurations": ["Main: 仅离线"],
       "stopAll": true
     }
   ]

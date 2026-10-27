@@ -66,6 +66,10 @@ db.sqlite3
 #---- models (huggingface / embedding ----
 models/
 
+# Docker compose 数据卷
+pg-data/
+tei-data/
+
 # ---- must keep ---
 !.vscode/
 !output/

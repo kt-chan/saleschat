@@ -1,15 +1,19 @@
 import json
 from pathlib import Path
 from typing import List, Dict, Optional
-
-from psycopg2.extras import execute_values
-
 import app.config as raw_config
 from app.settings import get_settings
 from app.logger import get_logger
 from app.utils import (
-    parallel_map, get_db_conn, release_db_conn, get_embedder,
-    parse_dialog, format_turns, pair_turns,
+    emb_to_bytes,
+    invalidate_embedding_index,
+    parallel_map,
+    get_db_conn,
+    release_db_conn,
+    get_embedder,
+    parse_dialog,
+    format_turns,
+    pair_turns,
 )
 from app.llm import LLMClient, get_llm_client
 
@@ -62,14 +66,18 @@ class LLMLabeler:
                     session_compliance="、".join(raw_config.SESSION_COMPLIANCE),
                     session_outcomes="、".join(raw_config.SESSION_OUTCOMES),
                 )
-                res = self.llm.call(prompt, temperature=self.cfg.llm_temperature_labeling)
+                res = self.llm.call(
+                    prompt, temperature=self.cfg.llm_temperature_labeling
+                )
             except Exception as e:
                 log.warning(f"Session labeling failed: {e}")
                 res = {"ptp": False, "final_outcomes": []}
             res["call_id"] = call["call_id"]
             return res
 
-        results = parallel_map(label, calls, self.cfg.llm_max_concurrency, "Session打标")
+        results = parallel_map(
+            label, calls, self.cfg.llm_max_concurrency, "Session打标"
+        )
 
         out_file = self.cfg.session_labels_file
         with open(out_file, "w", encoding="utf-8") as f:
@@ -79,7 +87,9 @@ class LLMLabeler:
         log.info(f"✅ Session Labels 已保存至 {out_file}")
         return results
 
-    def run_pairs(self, calls: List[Dict], sessions: Optional[List[Dict]] = None) -> List[Dict]:
+    def run_pairs(
+        self, calls: List[Dict], sessions: Optional[List[Dict]] = None
+    ) -> List[Dict]:
         log.info(f"Pair 打标与重写: {len(calls)} 通")
         sess_map = {s["call_id"]: s for s in (sessions or []) if s}
         cust_role = self.cfg.dialog_customer_role
@@ -106,16 +116,18 @@ class LLMLabeler:
                         overlapping.append(st.get("stage_name", ""))
                 session_stage_labels = "、".join([x for x in overlapping if x]) or "无"
 
-                tasks.append({
-                    "cid": c["call_id"],
-                    "q_idx": pair_start,
-                    "a_idx": min(p["a_idx"]) if p["a_idx"] else 0,
-                    "sess": sess_text,
-                    "chunk": chunk,
-                    "q": p["question"],
-                    "a": p["answer"],
-                    "session_stage_labels": session_stage_labels,
-                })
+                tasks.append(
+                    {
+                        "cid": c["call_id"],
+                        "q_idx": pair_start,
+                        "a_idx": min(p["a_idx"]) if p["a_idx"] else 0,
+                        "sess": sess_text,
+                        "chunk": chunk,
+                        "q": p["question"],
+                        "a": p["answer"],
+                        "session_stage_labels": session_stage_labels,
+                    }
+                )
 
         def label(t):
             try:
@@ -132,13 +144,17 @@ class LLMLabeler:
                     pair_keywords="、".join(raw_config.PAIR_KEYWORDS),
                     pair_emotions="、".join(raw_config.PAIR_EMOTIONS),
                 )
-                res = self.llm.call(prompt, temperature=self.cfg.llm_temperature_labeling)
+                res = self.llm.call(
+                    prompt, temperature=self.cfg.llm_temperature_labeling
+                )
             except Exception as e:
                 log.warning(f"Pair labeling failed: {e}")
                 res = {
                     "stage": raw_config.SOP_STAGES[0],
-                    "customer_intents": [raw_config.I.OTHER], "risk": "None",
-                    "rewritten_question": t["q"], "rewritten_answer": t["a"],
+                    "customer_intents": [raw_config.I.OTHER],
+                    "risk": "None",
+                    "rewritten_question": t["q"],
+                    "rewritten_answer": t["a"],
                 }
 
             stage = res.get("stage", "")
@@ -154,14 +170,23 @@ class LLMLabeler:
                 for it in raw_intents:
                     candidate_stages.update(raw_config.INTENT_TO_STAGES.get(it, []))
                 reachable = {stage} | {
-                    tgt for (src, _), tgt in raw_config.SOP_TRANSITIONS.items() if src == stage
+                    tgt
+                    for (src, _), tgt in raw_config.SOP_TRANSITIONS.items()
+                    if src == stage
                 }
-                for cs in (candidate_stages & reachable):
-                    aligned = [it for it in raw_intents
-                               if it in raw_config.ALLOWED_INTENTS_BY_STAGE.get(cs, set())]
+                for cs in candidate_stages & reachable:
+                    aligned = [
+                        it
+                        for it in raw_intents
+                        if it in raw_config.ALLOWED_INTENTS_BY_STAGE.get(cs, set())
+                    ]
                     if aligned:
                         log.info(f"[align] stage {stage} → {cs} (intents: {aligned})")
-                        stage, allowed, valid_intents = cs, raw_config.ALLOWED_INTENTS_BY_STAGE[cs], aligned
+                        stage, allowed, valid_intents = (
+                            cs,
+                            raw_config.ALLOWED_INTENTS_BY_STAGE[cs],
+                            aligned,
+                        )
                         break
 
             if not valid_intents:
@@ -184,7 +209,13 @@ class LLMLabeler:
             res["call_id"] = t["cid"]
             return res
 
-        results = [r for r in parallel_map(label, tasks, self.cfg.llm_max_concurrency, "Pair打标") if r]
+        results = [
+            r
+            for r in parallel_map(
+                label, tasks, self.cfg.llm_max_concurrency, "Pair打标"
+            )
+            if r
+        ]
 
         out_file = self.cfg.pair_labels_file
         with open(out_file, "w", encoding="utf-8") as f:
@@ -203,8 +234,10 @@ class PgvectorWriter:
         sess_map = {s["call_id"]: s for s in sessions if s}
         ptp_strict_stages = {raw_config.S.NEGOTIATE, raw_config.S.PTP}
         ptp_strict_intents = {
-            raw_config.I.SIGN, raw_config.I.PLAN_INSTALL,
-            raw_config.I.PLAN_SETTLE, raw_config.I.VOICE_CONFIRM,
+            raw_config.I.SIGN,
+            raw_config.I.PLAN_INSTALL,
+            raw_config.I.PLAN_SETTLE,
+            raw_config.I.VOICE_CONFIRM,
         }
 
         valid = []
@@ -213,48 +246,80 @@ class PgvectorWriter:
                 continue
             sess = sess_map.get(p["call_id"], {})
             is_ptp = sess.get("ptp", False)
-            if (p.get("stage") in ptp_strict_stages
-                    and p.get("primary_intent") in ptp_strict_intents
-                    and not is_ptp):
+            if (
+                p.get("stage") in ptp_strict_stages
+                and p.get("primary_intent") in ptp_strict_intents
+                and not is_ptp
+            ):
                 continue
             p["session_ptp"] = is_ptp
             p["session_outcomes"] = sess.get("final_outcomes", [])
             valid.append(p)
 
         log.info(f"[入库] 过滤后保留 {len(valid)} 条 Pairs 话术")
+        if not valid:
+            return
 
-        bs = self.cfg.db_write_batch_size
+        bs = max(1, self.cfg.db_write_batch_size)
+        inserted = 0
+
         for i in range(0, len(valid), bs):
-            batch = valid[i: i + bs]
-            texts = [f"[{p['stage']}][{p['primary_intent']}] {p['rewritten_question']}" for p in batch]
+            batch = valid[i : i + bs]
+            texts = [
+                f"[{p['stage']}][{p['primary_intent']}] {p['rewritten_question']}"
+                for p in batch
+            ]
             embs = self.model.encode(texts, normalize_embeddings=True)
+            # encode() 单条时可能返回 1D，统一成 2D
+            if embs.ndim == 1:
+                embs = embs.reshape(1, -1)
+
             data = [
-                (p["call_id"], p["stage"], p["primary_intent"],
-                 json.dumps(p.get("tags", []), ensure_ascii=False),
-                 p.get("risk", "None"), p["session_ptp"],
-                 json.dumps(p["session_outcomes"], ensure_ascii=False),
-                 p["rewritten_question"], p["rewritten_answer"], embs[j])
+                (
+                    p["call_id"],
+                    p["stage"],
+                    p["primary_intent"],
+                    json.dumps(p.get("tags", []), ensure_ascii=False),
+                    p.get("risk", "None"),
+                    p["session_ptp"],
+                    json.dumps(p["session_outcomes"], ensure_ascii=False),
+                    p["rewritten_question"],
+                    p["rewritten_answer"],
+                    emb_to_bytes(embs[j]),  # numpy → BYTEA
+                )
                 for j, p in enumerate(batch)
             ]
+
             conn = get_db_conn()
             try:
                 with conn.cursor() as cur:
-                    execute_values(
-                        cur,
+                    cur.executemany(
                         """
                         INSERT INTO qa_pairs
-                          (call_id, stage, primary_intent, tags, risk, session_ptp,
-                           session_outcomes, rewritten_question, rewritten_answer, embedding)
-                        VALUES %s
+                            (call_id, stage, primary_intent, tags, risk, session_ptp,
+                             session_outcomes, rewritten_question, rewritten_answer, embedding)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         """,
                         data,
                     )
                 conn.commit()
+                inserted += len(data)
+                log.info(f"[入库] batch {i // bs + 1} 写入 {len(data)} 条")
             except Exception as e:
-                log.error(f"入库失败: {e}")
-                conn.rollback()
+                log.error(f"入库失败 (batch {i // bs + 1}): {e}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             finally:
                 release_db_conn(conn)
+
+        # 循环外统一失效一次；下次查询时 _EmbeddingIndex 会重建
+        if inserted > 0:
+            invalidate_embedding_index()
+            log.info(
+                f"[入库] 共写入 {inserted} 条，embedding 索引已失效，" f"下次查询时重建"
+            )
 
 
 class GoldenScriptGenerator:
@@ -274,7 +339,12 @@ class GoldenScriptGenerator:
                         FROM qa_pairs WHERE stage=%s AND primary_intent=%s AND risk != 'High'
                     ) sub WHERE rn <= %s LIMIT %s
                     """,
-                    (stage, intent, self.cfg.golden_exact_per_tag, self.cfg.golden_exact_limit),
+                    (
+                        stage,
+                        intent,
+                        self.cfg.golden_exact_per_tag,
+                        self.cfg.golden_exact_limit,
+                    ),
                 )
                 rows = cur.fetchall()
                 mode = "exact"
@@ -287,7 +357,11 @@ class GoldenScriptGenerator:
                             FROM qa_pairs WHERE stage=%s AND risk != 'High'
                         ) sub WHERE rn <= %s LIMIT %s
                         """,
-                        (stage, self.cfg.golden_fuzzy_per_intent, self.cfg.golden_fuzzy_limit),
+                        (
+                            stage,
+                            self.cfg.golden_fuzzy_per_intent,
+                            self.cfg.golden_fuzzy_limit,
+                        ),
                     )
                     rows = cur.fetchall()
                     mode = "fuzzy"
@@ -297,10 +371,15 @@ class GoldenScriptGenerator:
         if not rows:
             return "empty", []
 
-        samples = "\n".join([f"- 客户: {r[0]}\n  坐席: {r[1]}\n  标签: {r[2]}" for r in rows])
+        samples = "\n".join(
+            [f"- 客户: {r[0]}\n  坐席: {r[1]}\n  标签: {r[2]}" for r in rows]
+        )
         try:
             prompt = self.llm.render(
-                "golden_script_prompt", stage=stage, intent=intent, samples=samples,
+                "golden_script_prompt",
+                stage=stage,
+                intent=intent,
+                samples=samples,
             )
             res = self.llm.call(prompt, temperature=self.cfg.llm_temperature_synthesis)
             return mode, res.get("golden_qa_pairs", [])
@@ -317,12 +396,21 @@ class GoldenScriptGenerator:
                 node[intent] = {"mode": mode, "golden_qa_pairs": data} if data else None
             graph["nodes"][stage] = {"intents": node}
         for (src, intent), tgt in raw_config.SOP_TRANSITIONS.items():
-            graph["edges"].append({"source": src, "target": tgt, "trigger_intent": intent})
+            graph["edges"].append(
+                {"source": src, "target": tgt, "trigger_intent": intent}
+            )
 
         graph["retrieval_index"] = {
-            "stage_to_intents": {s: list(its) for s, its in raw_config.SOP_FLOW.items()},
-            "intent_to_stages": {i: raw_config.INTENT_TO_STAGES.get(i, []) for i in raw_config.UNIFIED_INTENTS},
-            "legal_edges": [{"from_stage": s, "intent": i, "to_stage": t}
-                            for (s, i), t in raw_config.SOP_TRANSITIONS.items()],
+            "stage_to_intents": {
+                s: list(its) for s, its in raw_config.SOP_FLOW.items()
+            },
+            "intent_to_stages": {
+                i: raw_config.INTENT_TO_STAGES.get(i, [])
+                for i in raw_config.UNIFIED_INTENTS
+            },
+            "legal_edges": [
+                {"from_stage": s, "intent": i, "to_stage": t}
+                for (s, i), t in raw_config.SOP_TRANSITIONS.items()
+            ],
         }
         return graph

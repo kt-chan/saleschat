@@ -1,3 +1,0 @@
-# 仅 NPU 节点安装；CUDA / CPU 节点不安装此文件
-# 配套：CANN 9.0.0 + Python 3.12 + torch 2.10.0
-torch_npu==2.10.0.post4

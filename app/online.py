@@ -6,7 +6,7 @@ import re
 import app.config as raw_config
 from app.settings import Settings, get_settings
 from app.logger import get_logger
-from app.utils import get_db_conn, release_db_conn, get_embedder, parse_dialog
+from app.utils import get_db_conn, get_embedding_index, release_db_conn, get_embedder, parse_dialog
 
 _SENT_END_RE = re.compile(r"[。！？；;!?\n]")
 
@@ -114,60 +114,29 @@ class HybridRetriever:
                     frontier.append((tgt, hop + 1))
         return result
 
-    def _pgvector_hybrid(self, emb: np.ndarray, nodes: Dict[Tuple[str, str], int], top_k: int) -> List[Tuple]:
+    def _pgvector_hybrid(self, emb: np.ndarray,
+                        nodes: Dict[Tuple[str, str], int],
+                        top_k: int) -> List[Tuple]:
         if not nodes:
             return []
-        pairs = list(nodes.keys())
-        placeholders = ",".join(["(%s,%s)"] * len(pairs))
-        flat = [x for pair in pairs for x in pair]
-        emb_list = emb.tolist()
-        sql = f"""
-            SELECT stage, primary_intent, rewritten_question, rewritten_answer,
-                   1 - (embedding <=> %s::vector) AS similarity
-            FROM qa_pairs
-            WHERE (stage, primary_intent) IN ({placeholders}) AND risk != 'High'
-            ORDER BY embedding <=> %s::vector LIMIT %s
-        """
-        params = [emb_list] + flat + [emb_list, top_k]
-        conn = get_db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                return cur.fetchall()
-        finally:
-            release_db_conn(conn)
+        idx = get_embedding_index()
+        mask = idx.node_mask(nodes)
+        return idx.query(emb, mask, top_k)
 
-    def _pgvector_stage_fallback(self, emb: np.ndarray, stages: List[str], top_k: int) -> List[Tuple]:
-        emb_list = emb.tolist()
-        sql = """
-            SELECT stage, primary_intent, rewritten_question, rewritten_answer,
-                   1 - (embedding <=> %s::vector) AS similarity
-            FROM qa_pairs WHERE stage = ANY(%s) AND risk != 'High'
-            ORDER BY embedding <=> %s::vector LIMIT %s
-        """
-        conn = get_db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql, (emb_list, stages, emb_list, top_k))
-                return cur.fetchall()
-        finally:
-            release_db_conn(conn)
+
+    def _pgvector_stage_fallback(self, emb: np.ndarray,
+                                stages: List[str],
+                                top_k: int) -> List[Tuple]:
+        if not stages:
+            return []
+        idx = get_embedding_index()
+        mask = idx.stage_mask(stages)
+        return idx.query(emb, mask, top_k)
+
 
     def _pgvector_unrestricted(self, emb: np.ndarray, top_k: int) -> List[Tuple]:
-        emb_list = emb.tolist()
-        sql = """
-            SELECT stage, primary_intent, rewritten_question, rewritten_answer,
-                   1 - (embedding <=> %s::vector) AS similarity
-            FROM qa_pairs WHERE risk != 'High'
-            ORDER BY embedding <=> %s::vector LIMIT %s
-        """
-        conn = get_db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql, (emb_list, emb_list, top_k))
-                return cur.fetchall()
-        finally:
-            release_db_conn(conn)
+        idx = get_embedding_index()
+        return idx.query(emb, None, top_k)
 
     def _golden_in_memory(self, emb: np.ndarray, nodes: Dict[Tuple[str, str], int], top_per_node: int) -> List[Dict]:
         hits = []

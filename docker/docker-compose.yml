@@ -1,58 +1,118 @@
+# ============================================================
 # docker/docker-compose.yml
-version: '3.8'
+#
+# 说明：
+#   - 使用顶层 device_requests 声明 GPU，兼容所有 Docker Compose V2 版本
+#     （deploy.resources.reservations.devices 在部分版本 / WSL2 下会被忽略）
+#   - 所有相对路径以本文件所在目录（docker/）为基准，故用 ../ 回到项目根
+#   - app 使用 profiles 隔离，开发时只起 postgres + tei
+#
+# 启动：
+#   # 仅基础设施（开发调试）
+#   docker compose -f docker/docker-compose.yml up -d
+#
+#   # 全栈（含 app）
+#   docker compose -f docker/docker-compose.yml --profile app up -d --build
+#
+#   # 停止
+#   docker compose -f docker/docker-compose.yml down
+#
+#   # 停止并清空数据
+#   docker compose -f docker/docker-compose.yml down -v
+#   rm -rf pg-data tei-data
+# ============================================================
 
 services:
-  # 1. 向量数据库 (带 pgvector 扩展)
-  db:
-    image: pgvector/pgvector:pg16
-    container_name: cca_pgvector
+  # ============================================================
+  # PostgreSQL —— 独立容器，无 pgvector
+  # ============================================================
+  postgres:
+    image: postgres:16
+    container_name: cca-postgres
+    restart: unless-stopped
     environment:
+      POSTGRES_DB: cca_db
       POSTGRES_USER: cca_user
       POSTGRES_PASSWORD: cca_pass
-      POSTGRES_DB: cca_db
-      TZ: Asia/Hong_Kong
     ports:
       - "5432:5432"
     volumes:
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-      - pgdata:/var/lib/postgresql/data
+      - ../pg-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cca_user -d cca_db"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+    networks:
+      - cca
 
-  # 3. 应用服务 (离线/在线)
-  saleschat:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    container_name: cca_saleschat
-    environment:
-      TZ: Asia/Hong_Kong
-      HF_HOME: /app/models/huggingface
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
-    env_file:
-      - ../.env
+  # ============================================================
+  # TEI —— 远程 embedding 服务（NVIDIA RTX A1000，Ampere CC 8.6）
+  # ============================================================
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:89-1.9
+    container_name: text-embeddings-inference
+    runtime: nvidia
+    entrypoint: ["text-embeddings-router"]
+    command:
+      - "--model-id"
+      - "BAAI/bge-base-zh-v1.5"
+      - "--port"
+      - "80"
+    ports:
+      - "8080:80"
     volumes:
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-      # 挂载数据、日志、输出和模型缓存目录，防止数据丢失
-      - ../.env:/app/.env:ro
+      - ../models/huggingface/hub:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - cca
+
+  # ============================================================
+  # App —— 纯 Python 应用（可选，需 --profile app 才启动）
+  # ============================================================
+  app:
+    build:
+      context: ..                       # build context 是项目根（Dockerfile 在那）
+      dockerfile: Dockerfile
+    image: cca-app:latest
+    container_name: cca-app
+    profiles: ["app"]                   # 默认不启动，避免与 F5 调试冲突
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tei:
+        condition: service_healthy
+    env_file:
+      - ../.env                         # .env 在项目根
+    environment:
+      # 容器内用服务名，不能用 127.0.0.1（那是自身）
+      EMBEDDING_TEI_URL: http://tei:80
+      DB_HOST: postgres
+      DB_PORT: "5432"
+    ports:
+      - "8000:8000"
+    volumes:
       - ../data:/app/data
       - ../output:/app/output
+      - ../cache:/app/cache
       - ../log:/app/log
-      - ../models:/app/models
-    depends_on:
-      db:
-        condition: service_healthy
-    # 默认执行离线构建；如果要跑在线测试，使用：
-    # command: ["tail", "-f", "/dev/null"]
-    command: ["python", "-m", "app.main", "--mode", "offline"]
+    stop_grace_period: 15s              # 给正在跑的事务留点时间
+    networks:
+      - cca
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
-volumes:
-  pgdata:
-  redisdata:
-  model_cache:
+networks:
+  cca:
+    driver: bridge

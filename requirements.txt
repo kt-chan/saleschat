@@ -1,46 +1,42 @@
-# API & HTTP Clients
+# ==================== LLM & HTTP ====================
 openai>=1.20
-requests==2.32.5
+requests>=2.32
 
-# Utilities
+# ==================== Utilities ====================
 loguru>=0.7.0
 tqdm>=4.65.0
 PyYAML==6.0.2
 nanoid==2.0.0
-dotenv==0.9.9
-python-dotenv==1.1.1
 
-# Semantics and Graph Processing
-# torch / torchvision / torchaudio 由 Dockerfile 分架构安装，此处不要包含
-# torch==2.8.0
-# torchvision==0.23.0
-# torchaudio==2.8.0
-sentence-transformers==4.0.0
-transformers==4.51.1
+# ==================== Config & Validation ====================
 pydantic>=2.5
 pydantic-settings>=2.1
-bertopic==0.17.4
-faiss-cpu==1.9.0
+
+# ==================== Data science & NLP ====================
 numpy==1.26.4
 scipy==1.15.3
 scikit-learn==1.7.1
+pandas>=2.0
 networkx==3.4.2
+faiss-cpu==1.9.0
 umap-learn>=0.5.0
 hdbscan>=0.8.0
 jieba>=0.42.1
 rapidfuzz>=3.0.0
 
-# ==================== VectorDB ====================
-pgembed==0.2.0
-pgvector==0.5.1
-psycopg2-binary==2.9.13
+# ==================== PostgreSQL ====================
+# 独立 Docker Postgres，无 pgvector、无 embedded-postgres
+# [binary] 便携 wheel；[pool] 提供 psycopg_pool
+psycopg[binary,pool]>=3.2.0
 
-# ==================== Web 服务 ====================
+# ==================== Web service ====================
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
+python-multipart>=0.0.18
+fastapi-offline==1.7.7
 
-# ==================== Huggingface ====================
-huggingface_hub>=0.30 
+# ==================== Token counting ====================
+tiktoken>=0.7.0
 
 # ==================== Debug ====================
 debugpy==1.8.0

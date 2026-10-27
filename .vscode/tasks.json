@@ -1,0 +1,54 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Stack: Up",
+      "type": "shell",
+      "command": "python",
+      "args": ["scripts/stack.py", "up"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Stack: Down",
+      "type": "shell",
+      "command": "python",
+      "args": ["scripts/stack.py", "down"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Stack: Restart",
+      "type": "shell",
+      "command": "python",
+      "args": ["scripts/stack.py", "restart"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Stack: Status",
+      "type": "shell",
+      "command": "python",
+      "args": ["scripts/stack.py", "status"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Stack: Logs",
+      "type": "shell",
+      "command": "python",
+      "args": ["scripts/stack.py", "logs"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    }
+  ]
+}

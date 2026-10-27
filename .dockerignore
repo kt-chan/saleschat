@@ -1,32 +1,79 @@
 # .dockerignore
+#
+# Build context 白名单逻辑：
+#   把「运行期不需要、且体积大 / 含敏感信息」的内容全部排除。
+#   Dockerfile 里已有 `rm -rf data output log cache ...` 作为兜底，
+#   但 .dockerignore 从源头阻止这些目录被 tar 给 daemon，构建更快更干净。
 
 # ==================== 敏感配置与环境变量 ====================
-# 忽略所有本地环境变量文件
 .env
 .env.*
 !.env.example
 
 # ==================== 本地运行数据与缓存 ====================
-# 忽略本地生成的文件，避免打进镜像导致镜像臃肿或数据污染
+# 应用产物目录（Dockerfile 运行期会 rm，此处从源头排除更快）
 data/
 output/
 log/
 cache/
-local_pgdata/
-models/
+pg-data/
+tei-data/
+
+# ==================== Compose / 部署产物 ====================
+docker-compose.yml
+docker-compose.*.yml
+docker-compose.override.yml
 
 # ==================== Python 运行时产物 ====================
 __pycache__/
 *.py[cod]
 *$py.class
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# ==================== 测试与静态检查缓存 ====================
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ==================== 日志 / 运行时输出（未被上面目录覆盖的散落文件）===
+*.log
+*.jsonl
+sop_graph.json
+session_labels.json*
+pair_labels.json*
 
 # ==================== Git 与 IDE 相关 ====================
 .git/
 .gitignore
+.gitattributes
 .vscode/
 .idea/
 .DS_Store
+Thumbs.db
+
+# ==================== 开发辅助脚本（仅 VS Code 任务使用）====================
+scripts/stack.py
+
+# ==================== 容器运行时配置 ====================
 .crictl
+.crictl*
+
+# ==================== 其他 ====================
+*.swp
+*.swo
+*~
+.tmp/
+tmp/
