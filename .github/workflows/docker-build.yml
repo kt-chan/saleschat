@@ -23,7 +23,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  DOCKERFILE: ./Dockerfile
+  DOCKERFILE: ./docker/Dockerfile
 
 permissions:
   contents: read
