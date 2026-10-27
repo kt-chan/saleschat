@@ -13,8 +13,7 @@
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+        "PYTHONDONTWRITEBYTECODE": "1"
       },
       "preLaunchTask": "Stack: Up",
       "justMyCode": false,
@@ -31,8 +30,7 @@
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
-        "PYTHONUNBUFFERED": "1",
-        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+        "PYTHONUNBUFFERED": "1"
       },
       "preLaunchTask": "Stack: Up",
       "justMyCode": false
@@ -48,14 +46,11 @@
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
-        "PYTHONUNBUFFERED": "1",
-        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+        "PYTHONUNBUFFERED": "1"
       },
       "preLaunchTask": "Stack: Up",
       "justMyCode": false
     },
-
-    // ==================== FastAPI Server ====================
     {
       "name": "Server: FastAPI (调试)",
       "type": "debugpy",
@@ -67,8 +62,7 @@
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
         "PYTHONUNBUFFERED": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+        "PYTHONDONTWRITEBYTECODE": "1"
       },
       "preLaunchTask": "Stack: Up",
       "justMyCode": false
@@ -91,14 +85,12 @@
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
-        "PYTHONUNBUFFERED": "1",
-        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+        "PYTHONUNBUFFERED": "1"
       },
       "preLaunchTask": "Stack: Up",
       "subProcess": true,
       "justMyCode": false
     },
-
     {
       "name": "Evaluate: 评测",
       "type": "debugpy",
@@ -109,8 +101,7 @@
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "PYTHONPATH": "${workspaceFolder}",
-        "PYTHONUNBUFFERED": "1",
-        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+        "PYTHONUNBUFFERED": "1"
       },
       "preLaunchTask": "Stack: Up",
       "justMyCode": false
@@ -124,8 +115,7 @@
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}",
-        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+        "PYTHONPATH": "${workspaceFolder}"
       },
       "preLaunchTask": "Stack: Up",
       "justMyCode": false
@@ -139,8 +129,7 @@
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}",
-        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+        "PYTHONPATH": "${workspaceFolder}"
       },
       "preLaunchTask": "Stack: Up",
       "justMyCode": false
@@ -155,8 +144,7 @@
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}",
-        "EMBEDDING_TEI_URL": "http://127.0.0.1:8080"
+        "PYTHONPATH": "${workspaceFolder}"
       },
       "preLaunchTask": "Stack: Up",
       "justMyCode": false

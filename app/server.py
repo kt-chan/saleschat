@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from app.logger import get_logger
 from app.online import get_retriever, suggest_script_for_conversation
 from app.settings import get_settings
-from app.utils import get_db_conn, release_db_conn
+from app.utils import get_db_conn, get_embedder, release_db_conn
 
 log = get_logger(__name__)
 cfg = get_settings()
@@ -230,12 +230,6 @@ def health():
 
 @app.get("/health/ready", response_model=HealthResp)
 def health_ready():
-    """
-    就绪检查（readiness）。
-
-    探测 PG + TEI，任一不通返回 503，让 k8s 暂时摘流量等待恢复。
-    不要用作 livenessProbe。
-    """
     detail: Dict[str, str] = {}
 
     try:
@@ -248,11 +242,11 @@ def health_ready():
         detail["postgres"] = f"error: {e}"
 
     try:
-        r = requests.get(f"{cfg.embedding_tei_url}/info", timeout=3)
-        r.raise_for_status()
-        detail["tei"] = "ok"
+        # 兼容 native / openai 两种风格；发一次 "ping" 探针
+        get_embedder().health_check()
+        detail["embedding"] = "ok"
     except Exception as e:
-        detail["tei"] = f"error: {e}"
+        detail["embedding"] = f"error: {e}"
 
     if not all(v == "ok" for v in detail.values()):
         raise HTTPException(status_code=503, detail=f"not ready: {detail}")

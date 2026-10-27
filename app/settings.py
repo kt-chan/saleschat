@@ -29,7 +29,17 @@ class Settings(BaseSettings):
     embedding_sort_by_length: bool = True
 
     # Embedding — 远程 TEI
-    embedding_tei_url: str = "http://127.0.0.1:8080"
+    # EMBEDDING_TEI_URL 支持三种形式：
+    #   - base URL              (http://127.0.0.1:8080)
+    #   - native 完整 endpoint  (http://127.0.0.1:8080/embed)
+    #   - openai 完整 endpoint  (http://xxx:8010/v1/embeddings)
+    # 解析规则见 utils._TEIEmbedder._resolve_endpoint
+    embedding_tei_url: str = Field(
+        ...,
+        description="TEI 服务地址（base URL 或完整 endpoint）",
+    )
+    # auto: 根据 URL 后缀自动判断；native: TEI 原生 /embed；openai: /v1/embeddings
+    embedding_tei_style: str = "auto"
     embedding_tei_timeout: int = 30
     embedding_tei_batch_size: int = 16
     embedding_tei_concurrency: int = 8
@@ -44,9 +54,20 @@ class Settings(BaseSettings):
         if not v:
             raise ValueError(
                 "EMBEDDING_TEI_URL 为必填项（本版本只支持远程 TEI），"
-                "请设置为本地 TEI 服务地址，例如 http://127.0.0.1:8080"
+                "请设置为 TEI 服务地址，例如 http://127.0.0.1:8080 "
+                "或 http://xxx:8010/v1/embeddings"
             )
         return v.rstrip("/")
+
+    @field_validator("embedding_tei_style")
+    @classmethod
+    def _validate_tei_style(cls, v: str) -> str:
+        v = (v or "auto").strip().lower()
+        if v not in ("auto", "native", "openai"):
+            raise ValueError(
+                f"EMBEDDING_TEI_STYLE 必须是 auto / native / openai，收到 {v!r}"
+            )
+        return v
 
     # Dialog parsing
     dialog_parse_mode: str = "auto"

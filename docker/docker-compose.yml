@@ -57,8 +57,10 @@ services:
       HF_HOME: /data
     entrypoint: ["text-embeddings-router"]
     command:
-      - "--model-id"
-      - "BAAI/bge-base-zh-v1.5"        # 与 .env 的 EMBEDDING_MODEL 对齐（768 维）
+      - "--model-id"                   # 与 .env 的 EMBEDDING_MODEL 对齐（768 维）
+      - "BAAI/bge-base-zh-v1.5"        
+      - "--served-model-name"          # 强制 OpenAI 兼容端点使用标准模型名称
+      - "BAAI/bge-base-zh-v1.5" 
       - "--max-batch-tokens"
       - "4096"                          # RTX 2000 Ada 8GB，保守取值
       - "--max-batch-requests"
@@ -70,7 +72,7 @@ services:
       - "--tokenization-workers"
       - "2"
     ports:
-      - "8080:80"
+      - "8010:80"
     volumes:
       - ../models/huggingface/hub:/data
     deploy:
