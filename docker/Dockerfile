@@ -95,6 +95,11 @@ RUN apt-get update \
         iproute2 \
         less \
         jq \
+        vim-tiny \
+        iputils-ping \
+        netcat-openbsd \
+        postgresql-client \
+        dos2unix \
     && sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
     && sed -i 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen \
     && locale-gen \
