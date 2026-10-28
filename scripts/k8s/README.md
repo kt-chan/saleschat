@@ -1,6 +1,6 @@
 # CCA Kubernetes 部署
 
-`run.sh` / `stop.sh` 双脚本方案，零外部依赖（`envsubst` 可选）。覆盖首次部署、日常迭代、离线建库、停止清理的完整生命周期。
+`start.sh` / `stop.sh` 双脚本方案，零外部依赖（`envsubst` 可选）。覆盖首次部署、日常迭代、离线建库、停止清理的完整生命周期。
 
 ---
 
@@ -54,11 +54,11 @@ ls
 
 ```
 .env.example
-run.sh
+start.sh
 stop.sh
 README.md
 manifests/
-└── template/             # 10 个 yaml 模板（manifests/runtime/ 由 run.sh 生成）
+└── template/             # 10 个 yaml 模板（manifests/runtime/ 由 start.sh 生成）
     ├── 00-namespace.yaml
     ├── 01-pvc.yaml
     ├── 02-secret.yaml
@@ -114,12 +114,12 @@ minikube image load ghcr.io/kt-chan/saleschat-amd64:latest
 
 ```bash
 cd ~/app/saleschat/scripts/k8s
-chmod +x run.sh stop.sh
+chmod +x start.sh stop.sh
 
-./run.sh
+./start.sh
 ```
 
-`./run.sh` 无参数执行**完整流程**（约 **10~40 分钟**，视数据量和 Job 耗时）：
+`./start.sh` 无参数执行**完整流程**（约 **10~40 分钟**，视数据量和 Job 耗时）：
 
 ```
 1. render    从 .env + manifests/template/ 渲染出 manifests/runtime/*.yaml
@@ -207,20 +207,20 @@ curl -s -X POST http://127.0.0.1:8000/suggest \
 
 ### 命令速查
 
-#### `run.sh`（部署 / 更新 / 运行）
+#### `start.sh`（部署 / 更新 / 运行）
 
 | 命令 | 用途 | 耗时 |
 |---|---|---|
-| `./run.sh` | **完整部署**：render + upload + up + **offline** + pf | 10~40 分钟 |
-| `./run.sh online` | **只部署服务**：render + up + pf（跳过 upload 和 offline） | 3~60 秒 |
-| `./run.sh render` | 只渲染 manifests/runtime/ | 秒级 |
-| `./run.sh upload` | render + 上传模型/数据（已就绪会自动跳过） | 0~5 分钟 |
-| `./run.sh up` | render + 部署服务（配置未变不重启） | 3~60 秒 |
-| `./run.sh offline` | 跑离线建库 Job | 5~30 分钟 |
-| `./run.sh pf` | 起 port-forward | 秒级 |
-| `./run.sh pf-stop` | 停 port-forward | 秒级 |
-| `./run.sh status` | 查看部署状态 | 秒级 |
-| `./run.sh help` | 帮助 | 秒级 |
+| `./start.sh` | **完整部署**：render + upload + up + **offline** + pf | 10~40 分钟 |
+| `./start.sh online` | **只部署服务**：render + up + pf（跳过 upload 和 offline） | 3~60 秒 |
+| `./start.sh render` | 只渲染 manifests/runtime/ | 秒级 |
+| `./start.sh upload` | render + 上传模型/数据（已就绪会自动跳过） | 0~5 分钟 |
+| `./start.sh up` | render + 部署服务（配置未变不重启） | 3~60 秒 |
+| `./start.sh offline` | 跑离线建库 Job | 5~30 分钟 |
+| `./start.sh pf` | 起 port-forward | 秒级 |
+| `./start.sh pf-stop` | 停 port-forward | 秒级 |
+| `./start.sh status` | 查看部署状态 | 秒级 |
+| `./start.sh help` | 帮助 | 秒级 |
 
 #### `stop.sh`（停止 / 清理）
 
@@ -232,7 +232,7 @@ curl -s -X POST http://127.0.0.1:8000/suggest \
 
 ### 智能跳过机制
 
-`run.sh` 内部有两处幂等优化，稳态下不会做多余工作：
+`start.sh` 内部有两处幂等优化，稳态下不会做多余工作：
 
 | 操作 | 判断依据 | 已就绪时 |
 |---|---|---|
@@ -248,7 +248,7 @@ curl -s -X POST http://127.0.0.1:8000/suggest \
 
 ```bash
 vim .env             # 改配置
-./run.sh online      # 重新渲染 + 部署（配置变了会自动重启 app）
+./start.sh online      # 重新渲染 + 部署（配置变了会自动重启 app）
 ```
 
 `online` 会检测配置变化，只有内容真变了才 `rollout restart` app。
@@ -265,7 +265,7 @@ vim .env
 # DATA_DIR_LOCAL=$HOME/app/saleschat/data/202611
 # DATA_DIR_BATCH=202611
 
-./run.sh upload offline
+./start.sh upload offline
 ```
 
 `upload` 检测到远端文件数与本地不一致，会停 app、上传新数据、重启 app。TEI 全程在线。
@@ -282,7 +282,7 @@ docker build -f docker/dockerfile -t ghcr.io/kt-chan/saleschat-amd64:latest .
 minikube image load ghcr.io/kt-chan/saleschat-amd64:latest
 
 cd scripts/k8s
-FORCE_RESTART=1 ./run.sh online    # 强制重启 app 拉新镜像
+FORCE_RESTART=1 ./start.sh online    # 强制重启 app 拉新镜像
 ```
 
 > 因为 ConfigMap 内容未变，`online` 不会自动重启 app。`FORCE_RESTART=1` 强制拉新镜像。
@@ -293,7 +293,7 @@ FORCE_RESTART=1 ./run.sh online    # 强制重启 app 拉新镜像
 
 ```bash
 ./stop.sh            # 停 workload（保留所有数据）
-./run.sh online      # 重新起来（约 30 秒）
+./start.sh online      # 重新起来（约 30 秒）
 ```
 
 **关键**：`./stop.sh` 保留 PVC，模型和数据都不用重传，`up` 时 TEI 从 PVC 加载模型（30 秒内就绪）。
@@ -304,7 +304,7 @@ FORCE_RESTART=1 ./run.sh online    # 强制重启 app 拉新镜像
 
 ```bash
 ./stop.sh --purge    # 删 workload + PVC
-./run.sh             # 全新部署 + 重建库
+./start.sh             # 全新部署 + 重建库
 ```
 
 ⚠️ `--purge` 会删所有 PVC：`postgres-data`、`tei-data`、`app-data`、`app-output`。
@@ -315,7 +315,7 @@ FORCE_RESTART=1 ./run.sh online    # 强制重启 app 拉新镜像
 
 ```bash
 ./stop.sh --all      # 删所有 namespace
-./run.sh             # 全新部署 + 重建库
+./start.sh             # 全新部署 + 重建库
 ```
 
 ⚠️ `--all` 会删 namespace 本身。
@@ -335,7 +335,7 @@ vim .env
 # MODEL_SHORT_NAME=bge-large-zh-v1.5
 
 # 3. 上传 + 部署 + 重建库
-./run.sh upload up offline
+./start.sh upload up offline
 ```
 
 **警告**：换模型会改变向量维度（bge-base=768，bge-large=1024），**旧的 embedding 数据全部失效**。必须重新 `offline` 建库。
@@ -345,7 +345,7 @@ vim .env
 ### 场景 8：只重建库（模型数据都没变）
 
 ```bash
-./run.sh offline
+./start.sh offline
 ```
 
 例如：改了 prompts.yaml，或想用同样的数据重新生成 SOP 图谱。
@@ -401,7 +401,7 @@ ls -la /app/output/
 ### 场景 11：查看部署状态
 
 ```bash
-./run.sh status
+./start.sh status
 ```
 
 输出示例：
@@ -431,15 +431,15 @@ PF: Running → http://127.0.0.1:8000
 
 | 修改项 | 生效命令 | 是否重启 app |
 |---|---|---|
-| `LLM_BASE_URL` / `LLM_MODEL` / `EMBEDDING_TEI_URL` 等 ConfigMap 内容 | `./run.sh online` | ✅ 自动 |
-| `DB_PASSWORD` / `LLM_API_KEY`（Secret） | `./run.sh online` | ✅ 自动 |
-| `APP_IMAGE`（镜像地址） | `FORCE_RESTART=1 ./run.sh online` | ✅ 强制 |
-| `DATA_DIR_LOCAL` / `DATA_DIR_BATCH`（数据源） | `./run.sh upload offline` | ✅ 上传时停/启 |
-| `HF_CACHE_DIR` / `MODEL_DIR_NAME` / `MODEL_SHORT_NAME`（模型源） | `./run.sh upload up offline` | ✅ 上传时停/启 |
-| `NS` / `INFRA_PG_NS` / `INFRA_TEI_NS` | 先 `./stop.sh --all`，再 `./run.sh` | 全新部署 |
-| `PF_PORT` | `./run.sh pf-stop && ./run.sh pf` | 只重启 PF |
+| `LLM_BASE_URL` / `LLM_MODEL` / `EMBEDDING_TEI_URL` 等 ConfigMap 内容 | `./start.sh online` | ✅ 自动 |
+| `DB_PASSWORD` / `LLM_API_KEY`（Secret） | `./start.sh online` | ✅ 自动 |
+| `APP_IMAGE`（镜像地址） | `FORCE_RESTART=1 ./start.sh online` | ✅ 强制 |
+| `DATA_DIR_LOCAL` / `DATA_DIR_BATCH`（数据源） | `./start.sh upload offline` | ✅ 上传时停/启 |
+| `HF_CACHE_DIR` / `MODEL_DIR_NAME` / `MODEL_SHORT_NAME`（模型源） | `./start.sh upload up offline` | ✅ 上传时停/启 |
+| `NS` / `INFRA_PG_NS` / `INFRA_TEI_NS` | 先 `./stop.sh --all`，再 `./start.sh` | 全新部署 |
+| `PF_PORT` | `./start.sh pf-stop && ./start.sh pf` | 只重启 PF |
 
-**核心原则**：改 `.env` → `./run.sh online`（配置类）或 `./run.sh upload offline`（数据/模型类），脚本会判断需要做什么。
+**核心原则**：改 `.env` → `./start.sh online`（配置类）或 `./start.sh upload offline`（数据/模型类），脚本会判断需要做什么。
 
 ---
 
@@ -449,11 +449,11 @@ PF: Running → http://127.0.0.1:8000
 scripts/k8s/
 ├── .env.example
 ├── .env                    # cp .env.example .env 后修改（gitignore）
-├── run.sh
+├── start.sh
 ├── stop.sh
 ├── README.md
-├── .pf.pid                 # run.sh 生成（gitignore）
-├── .pf.log                 # run.sh 生成（gitignore）
+├── .pf.pid                 # start.sh 生成（gitignore）
+├── .pf.log                 # start.sh 生成（gitignore）
 └── manifests/
     ├── template/           # 模板（源，git 跟踪）
     │   ├── 00-namespace.yaml
@@ -467,7 +467,7 @@ scripts/k8s/
     │   └── upload/
     │       ├── app-upload.yaml
     │       └── tei-upload.yaml
-    └── runtime/            # run.sh render 生成（gitignore）
+    └── runtime/            # start.sh render 生成（gitignore）
         ├── 00-namespace.yaml
         ├── ...
         ├── 07-offline-job.yaml
@@ -491,14 +491,14 @@ manifests/runtime/
 
 | 现象 | 原因 | 修法 |
 |---|---|---|
-| `StatefulSet "postgres" is invalid: spec.serviceName ... immutable` | 之前 sts 的 `serviceName` 不同 | `kubectl delete sts postgres -n gv`，再 `./run.sh up` |
-| `Multi-Attach error for volume ...` | PVC 被其他 Pod 占用 | `run.sh upload` 会自动停 app/tei，无需手动 |
+| `StatefulSet "postgres" is invalid: spec.serviceName ... immutable` | 之前 sts 的 `serviceName` 不同 | `kubectl delete sts postgres -n gv`，再 `./start.sh up` |
+| `Multi-Attach error for volume ...` | PVC 被其他 Pod 占用 | `start.sh upload` 会自动停 app/tei，无需手动 |
 | `TEI Pod Pending`（`0/1 nodes are available: nvidia.com/gpu`） | 无 GPU 或 device plugin 未就绪 | 见「无 GPU 集群」 |
-| `CreateContainerConfigError` | Secret 或 ConfigMap 缺失 | `./run.sh online`（会自动 apply） |
+| `CreateContainerConfigError` | Secret 或 ConfigMap 缺失 | `./start.sh online`（会自动 apply） |
 | `ImagePullBackOff` | 镜像不在集群里 | `minikube image load xxx`，或改 `IMAGE_PULL_POLICY=IfNotPresent` |
 | `pf 30s 未就绪` | app 还没 Ready | `kubectl -n cca get pods` 查 app |
 | offline Job `CrashLoopBackOff` | 数据目录不存在 / 配置错误 | `kubectl -n cca logs job/cca-offline --tail=100` |
-| `/suggest` 返回 `SOP 图谱未找到` | 没跑过 offline 或 offline 失败 | `./run.sh offline`，见下节 |
+| `/suggest` 返回 `SOP 图谱未找到` | 没跑过 offline 或 offline 失败 | `./start.sh offline`，见下节 |
 | offline 报 `目录下未找到匹配文件: /app/data` | `DATA_DIR_BATCH` 未配或模板没改 | 见下节 |
 
 ### `/suggest` 返回 `SOP 图谱未找到`
@@ -513,7 +513,7 @@ kubectl -n cca get job cca-offline
 kubectl -n cca get pods -l job-name=cca-offline
 
 # 3. 没有就重新跑
-./run.sh offline
+./start.sh offline
 
 # 4. 若已有 job 但失败，看日志
 kubectl -n cca logs -l job-name=cca-offline --tail=100
@@ -536,7 +536,7 @@ grep DATA_DIR_BATCH .env
 # 期望：DATA_DIR_BATCH=202610
 
 # 4. 修完重新渲染 + 部署 + 建库
-./run.sh online offline
+./start.sh online offline
 ```
 
 ### 诊断命令
@@ -578,7 +578,7 @@ vim manifests/template/05-tei.yaml
 #    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
 
 # 3. 重新部署
-./run.sh online
+./start.sh online
 ```
 
 CPU 版 TEI：加载模型慢（5~10 分钟），吞吐低（~30 q/s），但功能完整。
@@ -611,13 +611,13 @@ rm -rf manifests/runtime/ .pf.pid .pf.log
 
 | 需求 | 命令 |
 |---|---|
-| **首次部署** | `cp .env.example .env && vim .env && ./run.sh` |
-| **改配置** | `vim .env && ./run.sh online` |
-| **改代码** | `docker build ... && minikube image load ... && FORCE_RESTART=1 ./run.sh online` |
-| **换数据** | 改 `.env` 的 `DATA_DIR_LOCAL` 和 `DATA_DIR_BATCH` → `./run.sh upload offline` |
-| **只重建库** | `./run.sh offline` |
-| **临时停** | `./stop.sh` → `./run.sh online` |
-| **重置数据** | `./stop.sh --purge && ./run.sh` |
+| **首次部署** | `cp .env.example .env && vim .env && ./start.sh` |
+| **改配置** | `vim .env && ./start.sh online` |
+| **改代码** | `docker build ... && minikube image load ... && FORCE_RESTART=1 ./start.sh online` |
+| **换数据** | 改 `.env` 的 `DATA_DIR_LOCAL` 和 `DATA_DIR_BATCH` → `./start.sh upload offline` |
+| **只重建库** | `./start.sh offline` |
+| **临时停** | `./stop.sh` → `./start.sh online` |
+| **重置数据** | `./stop.sh --purge && ./start.sh` |
 | **彻底清空** | `./stop.sh --all` |
-| **看状态** | `./run.sh status` |
+| **看状态** | `./start.sh status` |
 | **看日志** | `kubectl -n cca logs -f deploy/cca-app` |
