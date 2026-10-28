@@ -1,40 +1,10 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: gv
-  labels:
-    name: gv
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: postgres-secret
-  namespace: gv
-type: Opaque
-stringData:
-  POSTGRES_DB: "cca_db"
-  POSTGRES_USER: "cca_user"
-  POSTGRES_PASSWORD: "cca_pass"
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: postgres-data
-  namespace: gv
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: standard
-  resources:
-    requests:
-      storage: 10Gi
----
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: postgres
-  namespace: gv
+  namespace: ${INFRA_PG_NS}
 spec:
-  serviceName: gv-sql-service   # ← 从 postgres 改为 gv-sql-service
+  serviceName: ${INFRA_PG_SVC}
   replicas: 1
   selector:
     matchLabels:
@@ -62,14 +32,10 @@ spec:
               mountPath: /var/lib/postgresql/data
           readinessProbe:
             exec:
-              command: ["pg_isready", "-U", "cca_user", "-d", "cca_db"]
+              command: ["pg_isready", "-U", "${DB_USER}", "-d", "${DB_NAME}"]
             initialDelaySeconds: 10
             periodSeconds: 5
-          livenessProbe:
-            exec:
-              command: ["pg_isready", "-U", "cca_user", "-d", "cca_db"]
-            initialDelaySeconds: 30
-            periodSeconds: 10
+            failureThreshold: 6
           resources:
             requests:
               cpu: 200m
@@ -85,13 +51,12 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: gv-sql-service          # ← 从 postgres 改为 gv-sql-service
-  namespace: gv
+  name: ${INFRA_PG_SVC}
+  namespace: ${INFRA_PG_NS}
 spec:
   selector:
     app: postgres
   ports:
     - name: pg
-      port: 14003               # ← 从 5432 改为 14003
-      targetPort: 5432          # 容器内保持 5432
-      protocol: TCP
+      port: ${INFRA_PG_PORT}
+      targetPort: 5432

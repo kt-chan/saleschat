@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cca-app
+  namespace: ${NS}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cca-app
+  template:
+    metadata:
+      labels:
+        app: cca-app
+    spec:
+      containers:
+        - name: app
+          image: ${APP_IMAGE}
+          imagePullPolicy: ${IMAGE_PULL_POLICY}
+          command: ["python", "-m", "app.server"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: cca-config
+            - secretRef:
+                name: cca-secret
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: TZ
+              value: "Asia/Shanghai"
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: output
+              mountPath: /app/output
+            - name: cache
+              mountPath: /app/cache
+            - name: log
+              mountPath: /app/log
+            - name: prompts
+              mountPath: /app/prompts.yaml
+              subPath: prompts.yaml
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 300m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: app-data
+        - name: output
+          persistentVolumeClaim:
+            claimName: app-output
+        - name: cache
+          emptyDir: {}
+        - name: log
+          emptyDir: {}
+        - name: prompts
+          configMap:
+            name: cca-prompts
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cca-app
+  namespace: ${NS}
+spec:
+  selector:
+    app: cca-app
+  ports:
+    - port: 8000
+      targetPort: 8000

@@ -2,26 +2,26 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: cca-offline
-  namespace: cca
+  namespace: ${NS}
 spec:
   ttlSecondsAfterFinished: 3600
   backoffLimit: 1
   template:
+    metadata:
+      labels:
+        job-name: cca-offline
     spec:
       restartPolicy: OnFailure
       containers:
         - name: offline
-          image: ghcr.io/kt-chan/saleschat-amd64:latest
-          imagePullPolicy: Never
+          image: ${APP_IMAGE}
+          imagePullPolicy: ${IMAGE_PULL_POLICY}
           command: ["python", "-m", "app.main", "--mode", "offline"]
           envFrom:
             - configMapRef:
                 name: cca-config
             - secretRef:
                 name: cca-secret
-          env:
-            - name: PYTHONUNBUFFERED
-              value: "1"
           volumeMounts:
             - name: data
               mountPath: /app/data

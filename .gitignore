@@ -74,6 +74,9 @@ tei-data/
 !.vscode/
 !output/
 
-# Kubernetes 部署实际配置（含具体环境的连接信息）
-scripts/k8s/config.env
-scripts/k8s/config.env.bak.*
+# 生成的 manifests（run.sh render 产物）
+scripts/k8s/manifests/runtime/
+
+# port-forward 运行时文件
+.pf.pid
+.pf.log

@@ -1,61 +1,31 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: model-service
-  labels:
-    name: model-service
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: tei-model
-  namespace: model-service
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: standard
-  resources:
-    requests:
-      storage: 5Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: tei-data
-  namespace: model-service
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: standard
-  resources:
-    requests:
-      storage: 2Gi
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: tei-svc
-  namespace: model-service
+  name: ${INFRA_TEI_DEPLOY}
+  namespace: ${INFRA_TEI_NS}
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: tei
+      app: ${INFRA_TEI_LABEL}
   template:
     metadata:
       labels:
-        app: tei
+        app: ${INFRA_TEI_LABEL}
     spec:
       containers:
         - name: tei
-          image: ghcr.io/huggingface/text-embeddings-inference:89-1.9
+          image: ${TEI_IMAGE}
           imagePullPolicy: IfNotPresent
           command: ["text-embeddings-router"]
           args:
+            # ⚠️ 改：直连本地路径，不用 HF 缓存结构
             - "--model-id"
-            - "BAAI/bge-base-zh-v1.5"
+            - "/data/models/${MODEL_SHORT_NAME}"
             - "--served-model-name"
-            - "BAAI/bge-base-zh-v1.5"
+            - "${MODEL_ID}"
             - "--max-batch-tokens"
             - "4096"
             - "--max-client-batch-size"
@@ -65,8 +35,9 @@ spec:
             - "--tokenization-workers"
             - "2"
           env:
+            # HF_HOME 只用于其他可能的 HF 依赖，TEI 这次不用它找模型
             - name: HF_HOME
-              value: /hf
+              value: /data
             - name: HF_HUB_OFFLINE
               value: "1"
             - name: TRANSFORMERS_OFFLINE
@@ -75,25 +46,18 @@ spec:
             - name: http
               containerPort: 80
           volumeMounts:
-            - name: tei-model
-              mountPath: /hf
             - name: tei-data
               mountPath: /data
           startupProbe:
-            httpGet:
-              path: /health
-              port: http
+            httpGet: { path: /health, port: http }
             failureThreshold: 60
             periodSeconds: 10
           readinessProbe:
-            httpGet:
-              path: /health
-              port: http
+            httpGet: { path: /health, port: http }
             periodSeconds: 10
+            failureThreshold: 6
           livenessProbe:
-            httpGet:
-              path: /health
-              port: http
+            httpGet: { path: /health, port: http }
             initialDelaySeconds: 120
             periodSeconds: 30
           resources:
@@ -105,9 +69,6 @@ spec:
               memory: 6Gi
               nvidia.com/gpu: 1
       volumes:
-        - name: tei-model
-          persistentVolumeClaim:
-            claimName: tei-model
         - name: tei-data
           persistentVolumeClaim:
             claimName: tei-data
@@ -115,13 +76,12 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: tei-svc                 # ← 从 tei 改为 tei-svc
-  namespace: model-service
+  name: ${INFRA_TEI_SVC}
+  namespace: ${INFRA_TEI_NS}
 spec:
   selector:
-    app: tei
+    app: ${INFRA_TEI_LABEL}
   ports:
     - name: http
-      port: 8010                # ← 从 80 改为 8010
-      targetPort: 80            # 容器内保持 80
-      protocol: TCP
+      port: ${INFRA_TEI_PORT}
+      targetPort: 80

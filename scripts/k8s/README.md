@@ -1,258 +1,623 @@
 # CCA Kubernetes 部署
 
-## 快速开始
+`run.sh` / `stop.sh` 双脚本方案，零外部依赖（`envsubst` 可选）。覆盖首次部署、日常迭代、离线建库、停止清理的完整生命周期。
 
-```bash
-cd scripts/k8s
-chmod +x *.sh
-
-# 1. 配置（首次）
-./configure.sh --wizard
-
-# 2. 编辑密钥
-vim manifests/cca-secret.yaml       # 填 LLM_API_KEY
-
-# 3. 部署
-./install.sh                        # 生产：只部署 app
-./install.sh --dev                  # 开发：全量
-```
+---
 
 ## 目录
 
+- [前置条件](#前置条件)
+- [首次部署](#首次部署)
+- [日常使用](#日常使用)
+- [命令速查](#命令速查)
+- [常见场景](#常见场景)
+- [配置修改生效规则](#配置修改生效规则)
+- [目录结构](#目录结构)
+- [排障](#排障)
+- [无 GPU 集群](#无-gpu-集群)
+- [清理](#清理)
+
+---
+
+## 前置条件
+
+一次性检查，全部通过才能开始。
+
+```bash
+# 1. kubectl 可用且能连上集群
+kubectl cluster-info
+
+# 2. 集群能识别 GPU（TEI 需要）
+kubectl get node -o jsonpath='{.items[0].status.allocatable.nvidia\.com/gpu}'
+# 期望：1（无 GPU 见「无 GPU 集群」）
+
+# 3. app 镜像已存在于集群
+docker images | grep saleschat
+
+# 4. 本地已有模型和数据
+ls ~/app/saleschat/models/huggingface/hub/
+ls ~/app/saleschat/data/
+```
+
+---
+
+## 首次部署
+
+### 步骤 1：准备目录
+
+```bash
+cd ~/app/saleschat/scripts/k8s
+ls
+```
+
+应包含：
+
+```
+.env.example
+run.sh
+stop.sh
+README.md
+manifests/
+└── template/             # 10 个 yaml 模板（manifests/runtime/ 由 run.sh 生成）
+    ├── 00-namespace.yaml
+    ├── 01-pvc.yaml
+    ├── 02-secret.yaml
+    ├── 03-configmap.yaml
+    ├── 04-postgres.yaml
+    ├── 05-tei.yaml
+    ├── 06-app.yaml
+    ├── 07-offline-job.yaml
+    └── upload/
+        ├── app-upload.yaml
+        └── tei-upload.yaml
+```
+
+### 步骤 2：创建 `.env`
+
+```bash
+cp .env.example .env
+vim .env
+```
+
+**⚠️ 必须修改的 4 项**（不填无法启动）：
+
+| 变量 | 说明 | 示例 |
+|---|---|---|
+| `LLM_API_KEY` | LLM 的 API Key | `sk-xxxxxxxx` |
+| `HF_CACHE_DIR` | 本地 HF 缓存根目录（含 `hub/` 子目录） | `$HOME/app/saleschat/models/huggingface` |
+| `DATA_DIR_LOCAL` | 本地数据目录（含 `*.jsonl`） | `$HOME/app/saleschat/data/202610` |
+| `DATA_DIR_BATCH` | 容器内批次子目录名，决定 `DATA_DIR=/app/data/<BATCH>` | `202610` |
+
+**按需修改**：
+
+| 变量 | 默认值 | 何时改 |
+|---|---|---|
+| `LLM_BASE_URL` / `LLM_MODEL` | 智谱 GLM | 用其他 LLM |
+| `APP_IMAGE` | `ghcr.io/kt-chan/saleschat-amd64:latest` | 镜像在别处 |
+| `IMAGE_PULL_POLICY` | `Never` | 镜像在 registry 时改 `IfNotPresent` |
+| `NS` / `INFRA_PG_NS` / `INFRA_TEI_NS` | cca / gv / model-service | 集群布局不同 |
+| `PF_PORT` | `8000` | 端口冲突 |
+
+### 步骤 3：准备镜像
+
+```bash
+# minikube 场景
+minikube image ls | grep saleschat
+
+# 若不存在，构建 + 导入
+cd ~/app/saleschat
+docker build -f docker/dockerfile -t ghcr.io/kt-chan/saleschat-amd64:latest .
+minikube image load ghcr.io/kt-chan/saleschat-amd64:latest
+```
+
+### 步骤 4：一键部署（含建库）
+
+```bash
+cd ~/app/saleschat/scripts/k8s
+chmod +x run.sh stop.sh
+
+./run.sh
+```
+
+`./run.sh` 无参数执行**完整流程**（约 **10~40 分钟**，视数据量和 Job 耗时）：
+
+```
+1. render    从 .env + manifests/template/ 渲染出 manifests/runtime/*.yaml
+2. upload    起临时 Pod，tar 管道上传模型 + 数据到 PVC
+             （会暂停 app 和 TEI 释放 RWO PVC；已就绪则自动跳过）
+3. up        部署 postgres / tei / app
+             等 PG Ready → 等 TEI Ready → 重启 app
+4. offline   暂停 app → 跑 cca-offline Job（建库）→ 恢复 app
+5. pf        后台 port-forward :8000
+```
+
+**预期输出**：
+
+```
+[16:35:01] render → manifests/runtime/
+[16:35:01]   ✅ 10 文件
+[16:35:01] upload
+[16:35:02]   模型已就绪 (bge-base-zh-v1.5) → 跳过
+[16:35:02]   数据已就绪 (5/5) → 跳过
+[16:35:02]   ✅ 模型和数据均已在 PVC，跳过 upload
+[16:35:02] apply manifests
+[16:35:35]   配置未变 → 跳过 app 重启
+[16:35:35]   等待 postgres
+[16:35:48]   等待 TEI
+[16:36:20]   等待 app
+[16:36:25]   ✅
+[16:36:25]   暂停 app (1 → 0)
+[16:36:27]   运行 Job
+[16:45:30]   恢复 app (1)
+[16:45:55]   ✅
+[16:45:55] port-forward 127.0.0.1:8000
+[16:45:57]   ✅ http://127.0.0.1:8000
+```
+
+**首次部署时**（所有 PVC 为空），会看到真正的上传过程：
+
+```
+[16:35:01] upload
+[16:35:10]   暂停 app (0 → 0)
+[16:35:10]   暂停 TEI (0 → 0)
+[16:35:18]   起 upload pods
+[16:35:25]   模型: bge-base-zh-v1.5 (781M)
+[16:36:45]   数据: → /app/data/202610/ (5 个)
+[16:36:52]   恢复 TEI (0)
+[16:36:53]   恢复 app (0)
+[16:36:53]   ✅
+```
+
+### 步骤 5：验证
+
+```bash
+# 三个 Pod 都是 Running
+kubectl get pods -n gv
+kubectl get pods -n model-service
+kubectl get pods -n cca
+
+# 健康检查
+curl -s http://127.0.0.1:8000/health/ready | jq .
+# 期望：{"status":"ready","detail":{"postgres":"ok","embedding":"ok"}}
+
+# API 文档
+open http://127.0.0.1:8000/docs
+
+# 验证数据已入库
+kubectl -n cca exec deploy/cca-app -- python -c '
+from app.utils import get_db_conn, release_db_conn
+c = get_db_conn()
+c.cursor().execute("SELECT count(*) FROM qa_pairs")
+print(c.cursor().fetchone()[0])
+release_db_conn(c)
+'
+# 期望：非零数字
+
+# 在线接口测试
+curl -s -X POST http://127.0.0.1:8000/suggest \
+  -H "Content-Type: application/json" \
+  -d '{"conversation":"客户：我最近资金困难。"}' | jq .
+```
+
+**首次部署完成，系统可用。**
+
+---
+
+## 日常使用
+
+### 命令速查
+
+#### `run.sh`（部署 / 更新 / 运行）
+
+| 命令 | 用途 | 耗时 |
+|---|---|---|
+| `./run.sh` | **完整部署**：render + upload + up + **offline** + pf | 10~40 分钟 |
+| `./run.sh online` | **只部署服务**：render + up + pf（跳过 upload 和 offline） | 3~60 秒 |
+| `./run.sh render` | 只渲染 manifests/runtime/ | 秒级 |
+| `./run.sh upload` | render + 上传模型/数据（已就绪会自动跳过） | 0~5 分钟 |
+| `./run.sh up` | render + 部署服务（配置未变不重启） | 3~60 秒 |
+| `./run.sh offline` | 跑离线建库 Job | 5~30 分钟 |
+| `./run.sh pf` | 起 port-forward | 秒级 |
+| `./run.sh pf-stop` | 停 port-forward | 秒级 |
+| `./run.sh status` | 查看部署状态 | 秒级 |
+| `./run.sh help` | 帮助 | 秒级 |
+
+#### `stop.sh`（停止 / 清理）
+
+| 命令 | 删除内容 | 数据 |
+|---|---|---|
+| `./stop.sh` | workload（app + tei + postgres + config + secret） | ✅ PVC 保留 |
+| `./stop.sh --purge` | workload + PVC + config | ❌ 数据丢失 |
+| `./stop.sh --all` | 整个 namespace | ❌ 全部删除 |
+
+### 智能跳过机制
+
+`run.sh` 内部有两处幂等优化，稳态下不会做多余工作：
+
+| 操作 | 判断依据 | 已就绪时 |
+|---|---|---|
+| **模型上传** | `exec deploy/tei-svc -- test -f /data/models/<short>/config.json` | 不停 TEI，跳过上传 |
+| **数据上传** | `exec deploy/cca-app -- find /app/data/<batch> \| wc -l` 与本地数量比对 | 不停 app，跳过上传 |
+| **app 重启** | ConfigMap + Secret 内容 hash 前后对比 | 配置未变不重启 |
+
+---
+
+## 常见场景
+
+### 场景 1：改了业务配置（LLM、DB 等）
+
+```bash
+vim .env             # 改配置
+./run.sh online      # 重新渲染 + 部署（配置变了会自动重启 app）
+```
+
+`online` 会检测配置变化，只有内容真变了才 `rollout restart` app。
+
+**不用重传模型/数据。**
+
+---
+
+### 场景 2：换数据批次
+
+```bash
+# 假设新数据在 ~/app/saleschat/data/202611/
+vim .env
+# DATA_DIR_LOCAL=$HOME/app/saleschat/data/202611
+# DATA_DIR_BATCH=202611
+
+./run.sh upload offline
+```
+
+`upload` 检测到远端文件数与本地不一致，会停 app、上传新数据、重启 app。TEI 全程在线。
+
+`offline` 会用新数据重建 SOP 图谱。
+
+---
+
+### 场景 3：改了业务代码，重建镜像
+
+```bash
+cd ~/app/saleschat
+docker build -f docker/dockerfile -t ghcr.io/kt-chan/saleschat-amd64:latest .
+minikube image load ghcr.io/kt-chan/saleschat-amd64:latest
+
+cd scripts/k8s
+FORCE_RESTART=1 ./run.sh online    # 强制重启 app 拉新镜像
+```
+
+> 因为 ConfigMap 内容未变，`online` 不会自动重启 app。`FORCE_RESTART=1` 强制拉新镜像。
+
+---
+
+### 场景 4：临时停止，稍后重启
+
+```bash
+./stop.sh            # 停 workload（保留所有数据）
+./run.sh online      # 重新起来（约 30 秒）
+```
+
+**关键**：`./stop.sh` 保留 PVC，模型和数据都不用重传，`up` 时 TEI 从 PVC 加载模型（30 秒内就绪）。
+
+---
+
+### 场景 5：清空业务数据重建
+
+```bash
+./stop.sh --purge    # 删 workload + PVC
+./run.sh             # 全新部署 + 重建库
+```
+
+⚠️ `--purge` 会删所有 PVC：`postgres-data`、`tei-data`、`app-data`、`app-output`。
+
+---
+
+### 场景 6：彻底清空集群
+
+```bash
+./stop.sh --all      # 删所有 namespace
+./run.sh             # 全新部署 + 重建库
+```
+
+⚠️ `--all` 会删 namespace 本身。
+
+---
+
+### 场景 7：换 embedding 模型
+
+```bash
+# 1. 本地准备新模型
+ls ~/app/saleschat/models/huggingface/hub/models--BAAI--bge-large-zh-v1.5/
+
+# 2. 改 .env
+vim .env
+# MODEL_ID=BAAI/bge-large-zh-v1.5
+# MODEL_DIR_NAME=models--BAAI--bge-large-zh-v1.5
+# MODEL_SHORT_NAME=bge-large-zh-v1.5
+
+# 3. 上传 + 部署 + 重建库
+./run.sh upload up offline
+```
+
+**警告**：换模型会改变向量维度（bge-base=768，bge-large=1024），**旧的 embedding 数据全部失效**。必须重新 `offline` 建库。
+
+---
+
+### 场景 8：只重建库（模型数据都没变）
+
+```bash
+./run.sh offline
+```
+
+例如：改了 prompts.yaml，或想用同样的数据重新生成 SOP 图谱。
+
+---
+
+### 场景 9：查看日志
+
+```bash
+# app 日志
+kubectl -n cca logs -f deploy/cca-app
+
+# TEI 日志
+kubectl -n model-service logs -f deploy/tei-svc
+
+# PG 日志
+kubectl -n gv logs -f postgres-0
+
+# offline Job 日志
+kubectl -n cca logs -f job/cca-offline
+
+# port-forward 日志
+tail -f scripts/k8s/.pf.log
+```
+
+---
+
+### 场景 10：进入容器调试
+
+```bash
+kubectl -n cca exec -it deploy/cca-app -- bash
+```
+
+容器内：
+
+```bash
+# 查看环境变量
+env | grep -E "DB_|LLM_|EMBEDDING_|DATA_DIR"
+
+# 测 DB
+python -c "from app.utils import get_db_conn; print(get_db_conn())"
+
+# 测 TEI
+python -c "from app.utils import get_embedder; print(get_embedder().encode('test'))"
+
+# 查数据
+ls -la /app/data/
+ls -la /app/output/
+```
+
+---
+
+### 场景 11：查看部署状态
+
+```bash
+./run.sh status
+```
+
+输出示例：
+
+```
+=== gv ===
+NAME             READY   STATUS    AGE
+pod/postgres-0   1/1     Running   10m
+
+NAME                     TYPE        PORT(S)
+service/gv-sql-service   ClusterIP   ...:14003/TCP
+
+=== model-service ===
+...
+
+=== cca ===
+...
+
+PF: Running → http://127.0.0.1:8000
+```
+
+---
+
+## 配置修改生效规则
+
+改完 `.env` 后，用对应命令应用：
+
+| 修改项 | 生效命令 | 是否重启 app |
+|---|---|---|
+| `LLM_BASE_URL` / `LLM_MODEL` / `EMBEDDING_TEI_URL` 等 ConfigMap 内容 | `./run.sh online` | ✅ 自动 |
+| `DB_PASSWORD` / `LLM_API_KEY`（Secret） | `./run.sh online` | ✅ 自动 |
+| `APP_IMAGE`（镜像地址） | `FORCE_RESTART=1 ./run.sh online` | ✅ 强制 |
+| `DATA_DIR_LOCAL` / `DATA_DIR_BATCH`（数据源） | `./run.sh upload offline` | ✅ 上传时停/启 |
+| `HF_CACHE_DIR` / `MODEL_DIR_NAME` / `MODEL_SHORT_NAME`（模型源） | `./run.sh upload up offline` | ✅ 上传时停/启 |
+| `NS` / `INFRA_PG_NS` / `INFRA_TEI_NS` | 先 `./stop.sh --all`，再 `./run.sh` | 全新部署 |
+| `PF_PORT` | `./run.sh pf-stop && ./run.sh pf` | 只重启 PF |
+
+**核心原则**：改 `.env` → `./run.sh online`（配置类）或 `./run.sh upload offline`（数据/模型类），脚本会判断需要做什么。
+
+---
+
+## 目录结构
+
 ```
 scripts/k8s/
-├── config.env.example    # 配置模板（提交 git）
-├── config.env            # 实际配置（gitignore，首次自动创建）
-├── configure.sh          # 配置向导
-├── install.sh            # 部署
-├── status.sh             # 状态检查
-├── upload.sh             # 上传模型/数据
-├── offline.sh            # 离线建库
-├── uninstall.sh          # 卸载
-├── lib/common.sh         # 公共函数 + 自动加载 config.env
-└── manifests/            # 5 个 YAML
+├── .env.example
+├── .env                    # cp .env.example .env 后修改（gitignore）
+├── run.sh
+├── stop.sh
+├── README.md
+├── .pf.pid                 # run.sh 生成（gitignore）
+├── .pf.log                 # run.sh 生成（gitignore）
+└── manifests/
+    ├── template/           # 模板（源，git 跟踪）
+    │   ├── 00-namespace.yaml
+    │   ├── 01-pvc.yaml
+    │   ├── 02-secret.yaml
+    │   ├── 03-configmap.yaml
+    │   ├── 04-postgres.yaml
+    │   ├── 05-tei.yaml
+    │   ├── 06-app.yaml
+    │   ├── 07-offline-job.yaml
+    │   └── upload/
+    │       ├── app-upload.yaml
+    │       └── tei-upload.yaml
+    └── runtime/            # run.sh render 生成（gitignore）
+        ├── 00-namespace.yaml
+        ├── ...
+        ├── 07-offline-job.yaml
+        └── upload/
 ```
 
-## 配置管理
+`.gitignore`：
 
-### 配置文件
-
-`config.env` 保存所有可配置项。所有脚本 `source lib/common.sh` 后自动加载。
-
-**优先级**（高 → 低）：
-```
-shell 环境变量 > config.env > 脚本默认值
+```gitignore
+.env
+manifests/runtime/
+.pf.pid
+.pf.log
 ```
 
-即：
-```bash
-# 使用 config.env 里的 NS
-./install.sh
-
-# 临时覆盖（不影响 config.env）
-NS=my-app ./install.sh
-
-# 永久修改
-./configure.sh --set NS=my-app
-```
-
-### `configure.sh` 用法
-
-```bash
-# 显示当前配置
-./configure.sh
-
-# 交互式向导（推荐，首次必跑）
-./configure.sh --wizard
-
-# 用编辑器打开
-./configure.sh --edit
-
-# 修改单项
-./configure.sh --set NS=my-app
-./configure.sh --set IMAGE=ghcr.io/org/saleschat:v1.2.3
-./configure.sh --set PF_PORT=8080
-
-# 修改多项
-./configure.sh --set NS=my-app INFRA_PG_NS=prod-pg
-
-# 重置为模板默认
-./configure.sh --reset
-```
-
-## 配置项说明
-
-### 必改（生产环境）
-
-| 变量 | 示例 | 说明 |
-|---|---|---|
-| `LLM_API_KEY` | `sk-xxxxx` | **在 `manifests/cca-secret.yaml`** |
-| `DB_PASSWORD` | `cca_pass` | **在 `manifests/cca-secret.yaml`** |
-
-### 常用（改 config.env 即可）
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| **App** | | |
-| `NS` | `cca` | app namespace |
-| `IMAGE` | `ghcr.io/kt-chan/saleschat-amd64:latest` | app 镜像 |
-| `PF_PORT` | `8000` | port-forward 端口 |
-| **App 连接的 PG** | | |
-| `DB_HOST` | `postgres` | 默认走 bridge，改外部地址可直连 |
-| `DB_PORT` | `5432` | |
-| `DB_NAME` | `cca_db` | |
-| `DB_USER` | `cca_user` | |
-| **App 连接的 TEI** | | |
-| `EMBEDDING_TEI_URL` | `http://tei:80/v1/embeddings` | 默认走 bridge，可改外部 |
-| `EMBEDDING_MODEL` | `BAAI/bge-base-zh-v1.5` | Embedding 模型（与 TEI 侧一致） |
-| `MODEL_NAME` | 派生 | 从 `EMBEDDING_MODEL` 去前缀，用于本地路径 |
-| **LLM** | | |
-| `LLM_BASE_URL` | `https://api.openai.com/v1` | LLM 服务地址 |
-| `LLM_MODEL` | `gpt-4o-mini` | LLM 模型名 |
-| **日志** | | |
-| `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` |
-| **数据** | | |
-| `CALLS_FILE_PATTERN` | `*.jsonl` | offline 扫描的文件 glob |
-| **基础设施位置** | | |
-| `INFRA_PG_NS` | `gv` | PG namespace（bridge 指向这里） |
-| `INFRA_PG_SVC` | `postgres` | PG service 名 |
-| `INFRA_TEI_NS` | `model-service` | TEI namespace |
-| `INFRA_TEI_SVC` | `tei` | TEI service 名 |
-| **本地路径** | | |
-| `HF_CACHE_DIR` | `$HOME/app/saleschat/models/huggingface` | 本地 HF 缓存 |
-| `DATA_DIR_LOCAL` | `$HOME/app/saleschat/data` | 本地数据 |
-| `DEFAULT_BATCH` | 空 | 默认批次（空=自动选最新） |
-| `PROMPTS_FILE` | `$HOME/app/saleschat/prompts.yaml` | prompts 文件 |
-
-## 5 个脚本
-
-| 脚本 | 何时用 |
-|---|---|
-| `configure.sh` | **配置**（首次 / 换环境） |
-| `install.sh` | **部署**（生产 / `--dev` 开发） |
-| `status.sh` | **检查**（随时） |
-| `upload.sh` | **换数据/换模型** |
-| `offline.sh` | **建库** |
-| `uninstall.sh` | **下线** |
-
-## 典型工作流
-
-### 生产：首次部署
-
-```bash
-# 1. 配置（如果不在默认 namespace）
-./configure.sh --wizard
-
-# 2. 编辑密钥
-vim manifests/cca-secret.yaml
-
-# 3. 检查 infra（可选）
-./status.sh
-
-# 4. 部署
-./install.sh
-
-# 5. 验证
-curl -s http://127.0.0.1:8000/health/ready
-```
-
-### 生产：升级 app
-
-```bash
-# 打新 tag 后
-./configure.sh --set IMAGE=ghcr.io/org/saleschat:v1.2.3
-./install.sh --skip-build
-```
-
-### 开发：完整部署
-
-```bash
-./install.sh --dev
-./offline.sh
-```
-
-### 换数据
-
-```bash
-./upload.sh data data/202611
-./offline.sh
-```
-
-### 换模型
-
-```bash
-./configure.sh --set MODEL_NAME=bge-large-zh-v1.5
-./upload.sh model bge-large-zh-v1.5
-# 编辑 manifests/infra-ms.yaml 的 --model-id
-kubectl apply -f manifests/infra-ms.yaml
-```
-
-### 下线
-
-```bash
-./uninstall.sh              # 只清 app
-./uninstall.sh --purge      # 清 app + PVC
-./uninstall.sh --all        # 全清（含 infra）
-```
-
-## 容错
-
-| 场景 | 行为 |
-|---|---|
-| `config.env` 不存在 | 首次运行自动从 example 复制 |
-| 配置文件格式错误 | source 时报错并指出行号 |
-| `install.sh` 生产模式 infra 未就绪 | 明确报错并给出诊断命令，不动 infra |
-| 上传失败 | `trap` 自动删临时 Pod |
-| 端口被占用 | 自动清理 + 提示换 `PF_PORT` |
-| shell 环境变量覆盖 | **优先生效**，无需改 config.env |
+---
 
 ## 排障
 
-```bash
-# 一切从这里开始
-./configure.sh --show         # 检查配置
-./status.sh                   # 检查状态
-```
-
 ### 常见错误
 
-| 错误 | 修复 |
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| `StatefulSet "postgres" is invalid: spec.serviceName ... immutable` | 之前 sts 的 `serviceName` 不同 | `kubectl delete sts postgres -n gv`，再 `./run.sh up` |
+| `Multi-Attach error for volume ...` | PVC 被其他 Pod 占用 | `run.sh upload` 会自动停 app/tei，无需手动 |
+| `TEI Pod Pending`（`0/1 nodes are available: nvidia.com/gpu`） | 无 GPU 或 device plugin 未就绪 | 见「无 GPU 集群」 |
+| `CreateContainerConfigError` | Secret 或 ConfigMap 缺失 | `./run.sh online`（会自动 apply） |
+| `ImagePullBackOff` | 镜像不在集群里 | `minikube image load xxx`，或改 `IMAGE_PULL_POLICY=IfNotPresent` |
+| `pf 30s 未就绪` | app 还没 Ready | `kubectl -n cca get pods` 查 app |
+| offline Job `CrashLoopBackOff` | 数据目录不存在 / 配置错误 | `kubectl -n cca logs job/cca-offline --tail=100` |
+| `/suggest` 返回 `SOP 图谱未找到` | 没跑过 offline 或 offline 失败 | `./run.sh offline`，见下节 |
+| offline 报 `目录下未找到匹配文件: /app/data` | `DATA_DIR_BATCH` 未配或模板没改 | 见下节 |
+
+### `/suggest` 返回 `SOP 图谱未找到`
+
+```bash
+# 1. 确认 SOP 图谱是否存在
+POD=$(kubectl -n cca get pod -l app=cca-app -o jsonpath='{.items[0].metadata.name}')
+kubectl -n cca exec $POD -- ls -la /app/output/
+
+# 2. 若没有，检查 offline 是否跑过
+kubectl -n cca get job cca-offline
+kubectl -n cca get pods -l job-name=cca-offline
+
+# 3. 没有就重新跑
+./run.sh offline
+
+# 4. 若已有 job 但失败，看日志
+kubectl -n cca logs -l job-name=cca-offline --tail=100
+```
+
+### offline 报 `目录下未找到匹配文件: /app/data`
+
+说明 `DATA_DIR` 没指向数据子目录。检查：
+
+```bash
+# 1. ConfigMap 的 DATA_DIR
+kubectl -n cca get cm cca-config -o jsonpath='{.data.DATA_DIR}{"\n"}'
+# 期望：/app/data/<DATA_DIR_BATCH>
+
+# 2. 数据实际在哪
+kubectl -n cca exec deploy/cca-app -- ls /app/data/
+
+# 3. 若 DATA_DIR 是 /app/data，说明 .env 的 DATA_DIR_BATCH 未生效
+grep DATA_DIR_BATCH .env
+# 期望：DATA_DIR_BATCH=202610
+
+# 4. 修完重新渲染 + 部署 + 建库
+./run.sh online offline
+```
+
+### 诊断命令
+
+```bash
+# 三个 namespace 全览
+kubectl get all -n cca
+kubectl get all -n gv
+kubectl get all -n model-service
+
+# PVC 状态
+kubectl get pvc -n cca
+kubectl get pvc -n gv
+kubectl get pvc -n model-service
+
+# Pod 详细事件
+kubectl -n cca describe pod <pod-name> | tail -30
+
+# app 实际 env（确认 ConfigMap 生效）
+POD=$(kubectl -n cca get pod -l app=cca-app -o jsonpath='{.items[0].metadata.name}')
+kubectl -n cca exec $POD -- env | grep -E "DB_|LLM_|EMBEDDING_|DATA_DIR"
+
+# 端到端健康检查
+curl -s http://127.0.0.1:8000/health/ready | jq .
+```
+
+---
+
+## 无 GPU 集群
+
+如果集群没有 NVIDIA GPU：
+
+```bash
+# 1. 修改模板
+vim manifests/template/05-tei.yaml
+
+# 2. 删除 nvidia.com/gpu: 1 这一行
+#    并把 image 改为 CPU 版本：
+#    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+
+# 3. 重新部署
+./run.sh online
+```
+
+CPU 版 TEI：加载模型慢（5~10 分钟），吞吐低（~30 q/s），但功能完整。
+
+---
+
+## 清理
+
+```bash
+# 只清 app（保留 infra，30 秒重启）
+./stop.sh
+
+# 清所有 workload + PVC（下一轮全新建）
+./stop.sh --purge
+
+# 连 namespace 一起删（最彻底）
+./stop.sh --all
+
+# 确认
+kubectl get ns | grep -E "cca|gv|model-service"
+# 应无输出
+
+# 本地清理（可选）
+rm -rf manifests/runtime/ .pf.pid .pf.log
+```
+
+---
+
+## 一句话速记
+
+| 需求 | 命令 |
 |---|---|
-| `infra 未就绪` | 生产：联系平台团队；开发：`./install.sh --dev` |
-| `TEI CrashLoop` | `./upload.sh model bge-base-zh-v1.5` |
-| `配置错乱` | `./configure.sh --reset` 后重新配置 |
-| `namespace 不存在` | `./configure.sh --show` 检查配置 |
-
-
-# Final Instruciton
-cd ~/app/saleschat/scripts/k8s
-
-# 日常停服务（cca 停，数据保留，infra 完全不动）
-./undeploy.sh
-
-# 输出示例：
-# ==========================================
-#   CCA 卸载（仅 cca namespace）
-# ==========================================
-#   操作范围   : cca
-#   保护范围   : gv（PG） / model-service（TEI）— 不触碰
-#   模式       : DEFAULT（停服务，保留 cca 的 PVC/config）
-# ==========================================
-#
-# ==> 0. 确认共享基础设施状态（只读）
-#     gv（PG）       : namespace 存在，postgres pod 数=1  → 保持运行
-#     model-service（TEI）: namespace 存在，tei pod 数=1  → 保持运行
-#
-# ==> 1. 停止 port-forward
-# ==> 2. 停止 cca workload / svc
-# ==> 3. 保留 cca 的 PVC / ConfigMap / Secret
-#
-# 当前状态：
-#     cca            pods=0 svc=0 pvc=2
-#     gv             pods=1 svc=1 pvc=1  ← 共享 PG，未触碰
-#     model-service  pods=1 svc=1 pvc=2  ← 共享 TEI，未触碰
-#
-#   ⚠️  gv / model-service 保持运行，不会被本脚本删除
-
-# 之后重启只起 app（infra 还在，秒起）
-./deploy.sh --skip-infra
+| **首次部署** | `cp .env.example .env && vim .env && ./run.sh` |
+| **改配置** | `vim .env && ./run.sh online` |
+| **改代码** | `docker build ... && minikube image load ... && FORCE_RESTART=1 ./run.sh online` |
+| **换数据** | 改 `.env` 的 `DATA_DIR_LOCAL` 和 `DATA_DIR_BATCH` → `./run.sh upload offline` |
+| **只重建库** | `./run.sh offline` |
+| **临时停** | `./stop.sh` → `./run.sh online` |
+| **重置数据** | `./stop.sh --purge && ./run.sh` |
+| **彻底清空** | `./stop.sh --all` |
+| **看状态** | `./run.sh status` |
+| **看日志** | `kubectl -n cca logs -f deploy/cca-app` |
