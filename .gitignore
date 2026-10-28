@@ -73,3 +73,7 @@ tei-data/
 # ---- must keep ---
 !.vscode/
 !output/
+
+# Kubernetes 部署实际配置（含具体环境的连接信息）
+scripts/k8s/config.env
+scripts/k8s/config.env.bak.*

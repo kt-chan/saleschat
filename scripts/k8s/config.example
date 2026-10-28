@@ -1,0 +1,125 @@
+# ============================================================
+# scripts/k8s/config.env
+#
+# 优先级（高 → 低）：
+#   shell 环境变量 > config.env > 脚本内默认值
+# ============================================================
+
+
+# ============================================================
+# 运行时行为（会同步到 cca-config，可在 config.env 覆盖）
+# ============================================================
+
+# -------- 环境标识 --------
+CCA_ENV="prod"
+LOG_LEVEL="INFO"
+
+# -------- LLM --------
+# LLM_BASE_URL="https://api.openai.com/v1"
+# LLM_MODEL="gpt-4o-mini"
+LLM_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
+LLM_MODEL="GLM-4-FlashX-250414"
+# LLM_API_KEY 在 manifests/cca-secret.yaml
+
+# ⚠️ CLEAR_CACHE_ON_START=true 会清空 cache/、output/、qa_pairs
+CLEAR_CACHE_ON_START="false"
+STATE_MACHINE_MODE="guide"
+
+
+# ============================================================
+# scripts/k8s/config.env
+# ============================================================
+
+# ============================================================
+# Pod label（app=xxx）
+# Deployment / Service 名已由上面 INFRA_* 定义，
+# 这里只定义与之不同的 Pod label
+# ============================================================
+# TEI Pod 的 app label —— 与 Service/Deployment 名不同（tei ≠ tei-svc）
+INFRA_TEI_LABEL="tei"
+
+# App Pod 的 app label —— 与 Deployment 名相同（cca-app = cca-app）
+APP_LABEL="cca-app"
+
+# -------- App --------
+NS="cca"
+IMAGE="ghcr.io/kt-chan/saleschat-amd64:latest"
+PF_PORT="8000"
+PF_ADDRESS="127.0.0.1"
+PF_ENABLE="1"
+
+# ============================================================
+# Infra 位置（对齐生产）
+# ============================================================
+INFRA_PG_NS="gv"
+INFRA_PG_SVC="gv-sql-service"
+INFRA_PG_PORT="14003"
+INFRA_PG_TARGET_PORT="5432"
+
+INFRA_TEI_NS="model-service"
+INFRA_TEI_SVC="tei-svc"
+INFRA_TEI_PORT="8010"
+INFRA_TEI_TARGET_PORT="80"
+
+# ============================================================
+# App 连接串（会同步到 cca-config）
+# ============================================================
+DB_HOST="gv-sql-service.gv.svc.cluster.local"
+DB_PORT="14003"
+DB_NAME="cca_db"
+DB_USER="cca_user"
+
+EMBEDDING_TEI_URL="http://tei-svc.model-service.svc.cluster.local:8010/v1/embeddings"
+EMBEDDING_MODEL="BAAI/bge-base-zh-v1.5"
+EMBEDDING_TEI_STYLE="auto"
+
+# ============================================================
+# Embedding 运行参数
+# ============================================================
+EMB_CACHE_SIZE="2000"
+EMBEDDING_SORT_BY_LENGTH="true"
+EMBEDDING_TEI_TIMEOUT="30"
+EMBEDDING_TEI_BATCH_SIZE="16"
+EMBEDDING_TEI_CONCURRENCY="8"
+EMBEDDING_TEI_RETRY_MAX="3"
+EMBEDDING_TEI_RETRY_BACKOFF="2.0"
+EMBEDDING_TEI_TRUNCATE="true"
+
+# ============================================================
+# 检索参数
+# ============================================================
+ONLINE_TOP_K="3"
+ONLINE_SIM_THRESHOLD="0.50"
+HYBRID_MAX_HOPS="2"
+HYBRID_GOLDEN_WEIGHT="1.0"
+HYBRID_PG_WEIGHT="0.9"
+HYBRID_PG_TOP_K="20"
+HYBRID_GOLDEN_TOP_K_PER_NODE="2"
+HYBRID_HOP_DECAY="[1.0, 0.95, 0.85]"
+HYBRID_VOTE_TOP_N="5"
+
+# ============================================================
+# 模型（upload.sh 用）
+# ============================================================
+MODEL_ID="BAAI/bge-base-zh-v1.5"
+MODEL_DIR_NAME="models--BAAI--bge-base-zh-v1.5"
+
+TEI_PVC="tei-data"
+TEI_HF_HOME="/data"
+TEI_HUB_SUBDIR="hub"
+HF_CACHE_DIR="$HOME/app/saleschat/models/huggingface"
+
+# ============================================================
+# 数据（upload.sh / offline.sh 用）
+# ============================================================
+APP_DATA_PVC="app-data"
+APP_OUTPUT_PVC="app-output"
+DATA_DIR_LOCAL="$HOME/app/saleschat/data/202610"
+CALLS_FILE_PATTERN="*.jsonl"
+
+# ============================================================
+# 本地路径
+# ============================================================
+PROJECT_ROOT_OVERRIDE=""
+PROMPTS_FILE="$HOME/app/saleschat/prompts.yaml"
+DEFAULT_BATCH=""

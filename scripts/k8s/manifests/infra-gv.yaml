@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gv
+  labels:
+    name: gv
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: gv
+type: Opaque
+stringData:
+  POSTGRES_DB: "cca_db"
+  POSTGRES_USER: "cca_user"
+  POSTGRES_PASSWORD: "cca_pass"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: gv
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: gv
+spec:
+  serviceName: gv-sql-service   # ← 从 postgres 改为 gv-sql-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: postgres-secret
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: pg
+              containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "cca_user", "-d", "cca_db"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "cca_user", "-d", "cca_db"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gv-sql-service          # ← 从 postgres 改为 gv-sql-service
+  namespace: gv
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: pg
+      port: 14003               # ← 从 5432 改为 14003
+      targetPort: 5432          # 容器内保持 5432
+      protocol: TCP

@@ -1,0 +1,55 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cca-offline
+  namespace: cca
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: offline
+          image: ghcr.io/kt-chan/saleschat-amd64:latest
+          imagePullPolicy: Never
+          command: ["python", "-m", "app.main", "--mode", "offline"]
+          envFrom:
+            - configMapRef:
+                name: cca-config
+            - secretRef:
+                name: cca-secret
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: output
+              mountPath: /app/output
+            - name: cache
+              mountPath: /app/cache
+            - name: prompts
+              mountPath: /app/prompts.yaml
+              subPath: prompts.yaml
+              readOnly: true
+          resources:
+            requests:
+              cpu: 300m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: app-data
+        - name: output
+          persistentVolumeClaim:
+            claimName: app-output
+        - name: cache
+          emptyDir: {}
+        - name: prompts
+          configMap:
+            name: cca-prompts
+            optional: true

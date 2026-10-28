@@ -1,12 +1,25 @@
 from pathlib import Path
 from typing import Dict, List
+
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 项目根目录（app/ 的父目录）
+# 让 .env 查找不依赖 cwd：无论从哪启动（本地 / Docker / k8s）都能命中
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        # 多候选：项目根优先，cwd 兜底；不存在的路径 pydantic-settings 会静默跳过
+        env_file=(
+            _PROJECT_ROOT / ".env",
+            ".env",
+        ),
+        env_file_encoding="utf-8",
+        extra="ignore",
+        # 默认就是 False；显式写出避免未来升级带来行为变化
+        case_sensitive=False,
     )
 
     # LLM
@@ -21,23 +34,37 @@ class Settings(BaseSettings):
     llm_temperature_synthesis: float = 0.3
 
     # Embedding (common)
-    # 注意：本版本 embedding 仅通过远程 TEI 服务提供，进程内不加载任何本地模型。
+    # 本版本 embedding 仅通过远程 TEI 服务提供，进程内不加载任何本地模型。
     # embedding_model 仅作为“与 TEI 侧 --model-id 保持一致”的参考值，
     # 两边向量维度必须相同（BAAI/bge-base-zh-v1.5 → 768 维）。
     embedding_model: str = "BAAI/bge-base-zh-v1.5"
+
+    # 在线 embedding 缓存条数（LRU）。高频相似 query 场景可调大
+    # 环境变量：EMBED_CACHE_SIZE
     embed_cache_size: int = 2000
+
+    # 按长度排序后再分块，减少服务端 padding 浪费
+    # 环境变量：EMBEDDING_SORT_BY_LENGTH
     embedding_sort_by_length: bool = True
 
-    # Embedding — 远程 TEI
+    # Embedding — 远程服务
     # EMBEDDING_TEI_URL 支持三种形式：
-    #   - base URL              (http://127.0.0.1:8080)
-    #   - native 完整 endpoint  (http://127.0.0.1:8080/embed)
-    #   - openai 完整 endpoint  (http://xxx:8010/v1/embeddings)
-    # 解析规则见 utils._TEIEmbedder._resolve_endpoint
+    #   - base URL              (http://tei:80)
+    #   - native 完整 endpoint  (http://tei:80/embed)
+    #   - openai 完整 endpoint  (http://tei:80/v1/embeddings)
+    #
+    # 默认值面向 Kubernetes（Service 名 = tei，端口 = 80，OpenAI 兼容端点）。
+    # 本地开发必须在 .env 中显式覆盖为 http://127.0.0.1:8010/v1/embeddings
+    # （见 .env-sample），否则会因集群 DNS 不可用而解析失败。
     embedding_tei_url: str = Field(
-        ...,
-        description="TEI 服务地址（base URL 或完整 endpoint）",
+        default="http://tei:80/v1/embeddings",
+        description=(
+            "TEI 服务地址。默认值是 Kubernetes Service DNS "
+            "（http://tei:80/v1/embeddings），本地开发须在 .env 中覆盖。"
+            "可通过 .env 或环境变量 EMBEDDING_TEI_URL 提供。"
+        ),
     )
+
     # auto: 根据 URL 后缀自动判断；native: TEI 原生 /embed；openai: /v1/embeddings
     embedding_tei_style: str = "auto"
     embedding_tei_timeout: int = 30
@@ -53,9 +80,11 @@ class Settings(BaseSettings):
         v = (v or "").strip()
         if not v:
             raise ValueError(
-                "EMBEDDING_TEI_URL 为必填项（本版本只支持远程 TEI），"
-                "请设置为 TEI 服务地址，例如 http://127.0.0.1:8080 "
-                "或 http://xxx:8010/v1/embeddings"
+                "EMBEDDING_TEI_URL 为必填项。请通过以下任一方式提供：\n"
+                "  1) 项目根或 cwd 下的 .env 文件中写 EMBEDDING_TEI_URL=...\n"
+                "  2) 环境变量 export EMBEDDING_TEI_URL=...\n"
+                "  3) Kubernetes 中通过 ConfigMap/Secret 注入环境变量\n"
+                "  示例：http://tei:80/v1/embeddings 或 http://127.0.0.1:8010/v1/embeddings"
             )
         return v.rstrip("/")
 
@@ -67,6 +96,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"EMBEDDING_TEI_STYLE 必须是 auto / native / openai，收到 {v!r}"
             )
+        return v
+
+    @field_validator("embed_cache_size")
+    @classmethod
+    def _validate_embed_cache_size(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"EMBED_CACHE_SIZE 必须 ≥ 0，收到 {v}")
         return v
 
     # Dialog parsing
@@ -105,6 +141,7 @@ class Settings(BaseSettings):
     output_dir: str = "./output"
     cache_dir: str = "./cache"
     log_dir: str = "./log"
+    # Glob 模式：匹配 data_dir 下所有通话文件
     calls_file_pattern: str = "*.jsonl"
     prompt_file: str = "./prompts.yaml"
     demo_text: str = ""
