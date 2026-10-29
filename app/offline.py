@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Iterator, List, Dict, Optional
+
 import app.config as raw_config
 from app.settings import get_settings
 from app.logger import get_logger
@@ -20,30 +21,33 @@ from app.llm import LLMClient, get_llm_client
 log = get_logger(__name__)
 
 VALID_SUFFIXES = (".json", ".jsonl")
+DEFAULT_CALL_BATCH_SIZE = 1000
 
 
-def _read_raw_objs(f: Path) -> List[Dict]:
-    """读取单个 json / jsonl 文件并返回原始对象列表。"""
+# ---------------------------------------------------------------------------
+# Streaming readers (replaces _read_raw_objs)
+# ---------------------------------------------------------------------------
+def _iter_raw_objs(f: Path) -> Iterator[Dict]:
+    """逐条产出 raw obj。jsonl 流式；.json 仍整文件读（建议改 jsonl 或 ijson）。"""
     try:
         if f.suffix.lower() == ".jsonl":
-            objs: List[Dict] = []
             with open(f, "r", encoding="utf-8") as fh:
                 for lineno, line in enumerate(fh, 1):
                     s = line.strip()
                     if not s:
                         continue
                     try:
-                        objs.append(json.loads(s))
+                        yield json.loads(s)
                     except json.JSONDecodeError as e:
                         log.warning(f"跳过非法行 {f}:{lineno}: {e}")
-            return objs
         else:  # .json
             with open(f, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            return data if isinstance(data, list) else data.get("calls", [])
+            objs = data if isinstance(data, list) else data.get("calls", [])
+            for obj in objs:
+                yield obj
     except Exception as e:
         log.error(f"解析文件失败 {f}: {e}")
-        return []
 
 
 def _collect_files(
@@ -55,9 +59,7 @@ def _collect_files(
             log.warning(f"非 json/jsonl 文件: {p}")
             return []
         return [p]
-
     if p.is_dir():
-        # 有 pattern 用 pattern，否则用通用匹配
         pats = [pattern] if pattern else ["*.json", "*.jsonl"]
         it = p.rglob if recursive else p.glob
         seen: set[Path] = set()
@@ -73,7 +75,6 @@ def _collect_files(
                 f"目录下未找到匹配文件: {p} (pattern={pattern or '*.json|*.jsonl'})"
             )
         return files
-
     log.error(f"无效路径: {p}")
     return []
 
@@ -82,51 +83,80 @@ def load_calls(
     path: Optional[str] = None,
     pattern: Optional[str] = None,
     recursive: bool = False,
-) -> List[Dict]:
+) -> Iterator[List[Dict]]:
     """
-    加载通话数据。支持：
-      - 单个 .json / .jsonl 文件
-      - 目录下多个 .json / .jsonl 文件（默认只扫描一层，recursive=True 递归）
-      - path 为 None 时使用 .env 中的 DATA_DIR
-      - pattern 为 None 时使用 .env 中的 CALLS_FILE_PATTERN（如 part_*.jsonl）
-        pattern 仅对目录生效；未配置时回落到 *.json / *.jsonl
+    签名与旧版一致；现在返回的是 **分批迭代器**：每批 <= call_batch_size 条。
+    用法：
+        for batch in load_calls(path, pattern, recursive):
+            labeler.run_sessions(batch)
+            ...
+    如果旧代码是 calls = load_calls(...)，请改成 for batch in load_calls(...)。
     """
-    target = path 
+    target = path
     if not target:
         log.error("未提供 path 且 .env 中未配置 DATA_DIR")
-        return []
-
+        return
     p = Path(target)
     if not p.exists():
         log.error(f"文件/目录不存在: {target}")
-        return []
+        return
 
     files = _collect_files(p, pattern=pattern, recursive=recursive)
     if not files:
-        return []
+        return
 
-    calls: List[Dict] = []
-    skipped = 0
-    for f in files:
-        raw_objs = _read_raw_objs(f)
-        for obj in raw_objs:
-            obj["turns"] = parse_dialog(obj.get("dialog", ""))
-            if len(obj["turns"]) >= 2:
-                calls.append(obj)
-            else:
-                skipped += 1
+    try:
+        batch_size = int(
+            getattr(get_settings(), "call_batch_size", DEFAULT_CALL_BATCH_SIZE)
+            or DEFAULT_CALL_BATCH_SIZE
+        )
+    except Exception:
+        batch_size = DEFAULT_CALL_BATCH_SIZE
+    if batch_size <= 0:
+        batch_size = DEFAULT_CALL_BATCH_SIZE
 
-    log.info(
-        f"加载完成: 有效 {len(calls)} 通, 跳过 {skipped} 通, "
-        f"文件 {len(files)} 个 (来源: {target}, pattern={pattern or '默认'})"
-    )
-    return calls
+    log.info(f"流式加载: {len(files)} 个文件, batch_size={batch_size}")
+
+    batch: List[Dict] = []
+    total_valid = 0
+    total_skipped = 0
+    try:
+        for f in files:
+            for obj in _iter_raw_objs(f):
+                try:
+                    obj["turns"] = parse_dialog(obj.get("dialog", ""))
+                except Exception as e:
+                    log.warning(f"parse_dialog 失败 {f}: {e}")
+                    total_skipped += 1
+                    continue
+                if len(obj["turns"]) >= 2:
+                    batch.append(obj)
+                    total_valid += 1
+                    if len(batch) >= batch_size:
+                        yield batch
+                        batch = []
+                else:
+                    total_skipped += 1
+        if batch:
+            yield batch
+            batch = []
+    finally:
+        log.info(
+            f"加载完成: 有效 {total_valid} 通, 跳过 {total_skipped} 通, "
+            f"文件 {len(files)} 个 (来源: {target}, pattern={pattern or '默认'})"
+        )
 
 
+# ---------------------------------------------------------------------------
+# Labelers — signatures unchanged, output files now append (first call truncates)
+# ---------------------------------------------------------------------------
 class LLMLabeler:
     def __init__(self, llm: Optional[LLMClient] = None):
         self.llm = llm or get_llm_client()
         self.cfg = self.llm.cfg
+        # 首次写文件用 "w" 截断，之后批次用 "a" 追加
+        self._session_file_initialized = False
+        self._pair_file_initialized = False
 
     def run_sessions(self, calls: List[Dict]) -> List[Dict]:
         def label(call):
@@ -156,11 +186,19 @@ class LLMLabeler:
         )
 
         out_file = self.cfg.session_labels_file
-        with open(out_file, "w", encoding="utf-8") as f:
+        try:
+            Path(out_file).parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        mode = "a" if self._session_file_initialized else "w"
+        with open(out_file, mode, encoding="utf-8") as f:
+            n = 0
             for r in results:
                 if r:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        log.info(f"✅ Session Labels 已保存至 {out_file}")
+                    n += 1
+        self._session_file_initialized = True
+        log.info(f"Session Labels 追加 {n} 条 -> {out_file}")
         return results
 
     def run_pairs(
@@ -294,13 +332,22 @@ class LLMLabeler:
         ]
 
         out_file = self.cfg.pair_labels_file
-        with open(out_file, "w", encoding="utf-8") as f:
+        try:
+            Path(out_file).parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        mode = "a" if self._pair_file_initialized else "w"
+        with open(out_file, mode, encoding="utf-8") as f:
             for r in results:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        log.info(f"✅ Pair Labels 已保存至 {out_file}")
+        self._pair_file_initialized = True
+        log.info(f"Pair Labels 追加 {len(results)} 条 -> {out_file}")
         return results
 
 
+# ---------------------------------------------------------------------------
+# Pgvector writer — unchanged
+# ---------------------------------------------------------------------------
 class PgvectorWriter:
     def __init__(self):
         self.cfg = get_settings()
@@ -338,7 +385,6 @@ class PgvectorWriter:
 
         bs = max(1, self.cfg.db_write_batch_size)
         inserted = 0
-
         for i in range(0, len(valid), bs):
             batch = valid[i : i + bs]
             texts = [
@@ -346,7 +392,6 @@ class PgvectorWriter:
                 for p in batch
             ]
             embs = self.model.encode(texts, normalize_embeddings=True)
-            # encode() 单条时可能返回 1D，统一成 2D
             if embs.ndim == 1:
                 embs = embs.reshape(1, -1)
 
@@ -361,7 +406,7 @@ class PgvectorWriter:
                     json.dumps(p["session_outcomes"], ensure_ascii=False),
                     p["rewritten_question"],
                     p["rewritten_answer"],
-                    emb_to_bytes(embs[j]),  # numpy → BYTEA
+                    emb_to_bytes(embs[j]),
                 )
                 for j, p in enumerate(batch)
             ]
@@ -390,14 +435,14 @@ class PgvectorWriter:
             finally:
                 release_db_conn(conn)
 
-        # 循环外统一失效一次；下次查询时 _EmbeddingIndex 会重建
         if inserted > 0:
             invalidate_embedding_index()
-            log.info(
-                f"[入库] 共写入 {inserted} 条，embedding 索引已失效，" f"下次查询时重建"
-            )
+            log.info(f"[入库] 本批写入 {inserted} 条，embedding 索引已失效")
 
 
+# ---------------------------------------------------------------------------
+# Golden script / SOP graph — unchanged
+# ---------------------------------------------------------------------------
 class GoldenScriptGenerator:
     def __init__(self, llm: Optional[LLMClient] = None):
         self.llm = llm or get_llm_client()
@@ -490,3 +535,49 @@ class GoldenScriptGenerator:
             ],
         }
         return graph
+
+
+# ---------------------------------------------------------------------------
+# Optional convenience entry point. If you already have a main(), just copy
+# the loop below — nothing new to import.
+# ---------------------------------------------------------------------------
+def run(
+    path: Optional[str] = None,
+    pattern: Optional[str] = None,
+    recursive: bool = False,
+):
+    labeler = LLMLabeler()
+    writer = PgvectorWriter()
+    generator = GoldenScriptGenerator()
+
+    total_calls = 0
+    total_pairs = 0
+    batch_idx = 0
+
+    # Phase 1 — 流式分批：load_calls → session → pair → pgvector
+    for batch in load_calls(path, pattern, recursive):
+        batch_idx += 1
+        log.info(f"[批次 {batch_idx}] 载入 {len(batch)} 通 calls")
+        sessions = pairs = None
+        try:
+            sessions = labeler.run_sessions(batch)
+            pairs = labeler.run_pairs(batch, sessions)
+            total_calls += len(batch)
+            total_pairs += len(pairs or [])
+            writer.write(pairs, sessions)
+        except Exception as e:
+            log.exception(f"[批次 {batch_idx}] 处理失败: {e}")
+        finally:
+            # 打破引用，让本批内存尽快被 GC 回收
+            del batch, sessions, pairs
+
+    log.info(
+        f"✅ 第 1 阶段完成: {batch_idx} 批, {total_calls} 通 calls, "
+        f"{total_pairs} 条 pairs 已入库"
+    )
+
+    # Phase 2 — 全部入库完成之后，构建 SOP 图（读取 pgvector）
+    log.info("开始第 2 阶段: SOP 图构建 ...")
+    graph = generator.build_graph()
+    log.info("✅ 第 2 阶段完成: SOP 图构建完成")
+    return graph

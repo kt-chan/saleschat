@@ -53,19 +53,44 @@ def offline_pipeline():
 
     init_db()
 
-    log.info("=== 阶段1: 解析原始会话 ===")
-    calls = load_calls(cfg.data_dir, cfg.calls_file_pattern)
-    if not calls:
+    labeler = LLMLabeler()
+    writer = PgvectorWriter()
+
+    batche_num = 0
+    total_calls = 0
+    total_pairs = 0
+
+    # 阶段 1–3 合并：流式解析 → 双级打标 → 向量入库
+    log.info("=== 阶段1-3: 流式解析 → LLM 双级打标 → 向量化入库 ===")
+    for idx, batch in enumerate(
+        load_calls(cfg.data_dir, cfg.calls_file_pattern), 1
+    ):
+        batche_num = idx
+        total_calls += len(batch)
+        log.info(f"[批次 {idx}] {len(batch)} 通 calls")
+
+        sessions = pairs = None
+        try:
+            sessions = labeler.run_sessions(batch)       # 首写截断，后续追加
+            pairs = labeler.run_pairs(batch, sessions)   # 同上
+            total_pairs += len(pairs or [])
+            writer.write(pairs, sessions)                # 每批独立 commit
+        except Exception as e:
+            log.exception(f"[批次 {idx}] 处理失败: {e}")
+        finally:
+            # 主动断开引用，让本批内存被 GC 回收
+            del batch, sessions, pairs
+
+    if batche_num == 0:
+        log.warning("⚠️ 无有效数据，跳过后续阶段")
         return
 
-    log.info("=== 阶段2: LLM 双级打标 (自动落盘) ===")
-    labeler = LLMLabeler()
-    sessions = labeler.run_sessions(calls)
-    pairs = labeler.run_pairs(calls, sessions)
+    log.info(
+        f"✅ 阶段1-3 完成: {batche_num} 批 / {total_calls} 通 / "
+        f"{total_pairs} 条 pairs 已入库"
+    )
 
-    log.info("=== 阶段3: 向量化入库 ===")
-    PgvectorWriter().write(pairs, sessions)
-
+    # 阶段 4 保持不变：读取 pgvector 中已完成的全量数据构建 SOP 图
     log.info("=== 阶段4: 图谱合成经典 Q&A (自动落盘) ===")
     graph = GoldenScriptGenerator().build_graph()
     with open(cfg.sop_graph_file, "w", encoding="utf-8") as f:
@@ -147,9 +172,12 @@ def online_demo():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["offline", "online"], default="offline")
+    parser.add_argument("--mode", choices=["all", "offline", "online"], default="offline")
     args = parser.parse_args()
     if args.mode == "offline":
         offline_pipeline()
     elif args.mode == "online":
+        online_demo()
+    elif args.mode == "all":
+        offline_pipeline()
         online_demo()
