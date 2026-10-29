@@ -1,276 +1,314 @@
 #!/usr/bin/env bash
 #
-# start.sh — CCA Kubernetes 部署入口
-#
-# 默认：生产部署（跳过 infra，用已有 PG/TEI；跳过模型上传，由 infra 团队管）
-#   ./start.sh                # = prod：render + upload(仅数据) + up + offline + pf
-#
-#   ./start.sh dev            # 完整部署：render + upload(模型+数据) + up + offline + pf
-#   ./start.sh online         # 只部署服务：render + up + pf（迭代用，跳过 upload/offline）
-#   ./start.sh render         # 只渲染 manifests/runtime/
-#   ./start.sh upload         # 上传模型/数据到 PVC（已就绪自动跳过）
-#   ./start.sh up             # 部署服务（配置未变不重启 app）
-#   ./start.sh offline        # 跑离线建库 Job
-#   ./start.sh pf             # 起 port-forward
-#   ./start.sh pf-stop        # 停 port-forward
-#   ./start.sh status         # 查看状态
-#   ./start.sh help           # 帮助
+# start.sh — CCA Kubernetes 部署入口 (Host 快检 + Pod 深检)
 #
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; cd "$DIR"
 
-[ -f .env ] || { echo "ERROR: .env 不存在，先执行: cp .env.example .env && vim .env" >&2; exit 1; }
+for c in kubectl curl; do
+    command -v "$c" >/dev/null 2>&1 || { echo "ERROR: 缺少命令 $c" >&2; exit 1; }
+done
+
+[ -f .env ] || { echo "ERROR: .env 不存在" >&2; exit 1; }
 set -a; . ./.env; set +a
 
-# ============================================================
 # 必改项校验
-# ============================================================
-_fail=0
-[ "${LLM_API_KEY:-}" = "sk-REPLACE_ME" ] && { echo "ERROR: .env 的 LLM_API_KEY 还是占位符" >&2; _fail=1; }
-[ -z "${HF_CACHE_DIR:-}" ] && { echo "ERROR: .env 的 HF_CACHE_DIR 未设置" >&2; _fail=1; }
-[ -z "${DATA_DIR_LOCAL:-}" ] && { echo "ERROR: .env 的 DATA_DIR_LOCAL 未设置" >&2; _fail=1; }
-[ "$_fail" = "1" ] && exit 1
+if [ -z "${LLM_API_KEY:-}" ] || [ "${LLM_API_KEY}" = "sk-REPLACE_ME" ]; then
+    echo "ERROR: .env 的 LLM_API_KEY 未设置或仍为占位符" >&2; exit 1
+fi
+if [ -z "${APP_IMAGE:-}" ]; then
+    echo "ERROR: .env 的 APP_IMAGE 未设置" >&2; exit 1
+fi
 
-# ---------- 默认值 ----------
+# 默认值
 : "${NS:=cca}" "${INFRA_PG_NS:=gv}" "${INFRA_TEI_NS:=model-service}"
 : "${INFRA_PG_SVC:=gv-sql-service}" "${INFRA_PG_PORT:=14003}"
-: "${INFRA_TEI_SVC:=tei-svc}" "${INFRA_TEI_DEPLOY:=tei-svc}" "${INFRA_TEI_LABEL:=tei}" "${INFRA_TEI_PORT:=8010}"
-: "${APP_IMAGE:=ghcr.io/kt-chan/saleschat-amd64:latest}"
-: "${TEI_IMAGE:=ghcr.io/huggingface/text-embeddings-inference:89-1.9}"
-: "${IMAGE_PULL_POLICY:=Never}" "${STORAGE_CLASS:=standard}"
+: "${INFRA_TEI_DEPLOY:=tei-svc}" "${INFRA_TEI_PORT:=8010}"
 : "${PF_PORT:=8000}" "${PF_ADDRESS:=127.0.0.1}"
-: "${MODEL_ID:=BAAI/bge-base-zh-v1.5}"
-: "${MODEL_DIR_NAME:=models--BAAI--bge-base-zh-v1.5}"
 : "${MODEL_SHORT_NAME:=bge-base-zh-v1.5}"
 : "${HF_CACHE_DIR:=$HOME/app/saleschat/models/huggingface}"
 : "${DATA_DIR_LOCAL:=$HOME/app/saleschat/data/202610}"
-: "${DATA_DIR_BATCH:=$(basename "$DATA_DIR_LOCAL")}"
-: "${CALLS_FILE_PATTERN:=*.jsonl}"
+: "${DATA_BATCH:=$(basename "$DATA_DIR_LOCAL")}"
+: "${LLM_TIMEOUT:=240}"
 
 TPL="$DIR/manifests/template"
 OUT="$DIR/manifests/runtime"
+PROBE_TPL="$DIR/manifests/probe-pod.yaml"
 PF_PID="$DIR/.pf.pid"; PF_LOG="$DIR/.pf.log"
 
 L() { echo "[$(date +%H:%M:%S)] $*"; }
 W() { echo "[$(date +%H:%M:%S)] WARN: $*" >&2; }
 
 # ============================================================
-# render
+# 0-A. Host 层快速预检
+# ============================================================
+precheck_host_llm() {
+    L "Running Host LLM pre-check..."
+    local base="${LLM_BASE_URL%/}"
+    base="${base%/chat/completions}"
+    local url="${base}/chat/completions"
+
+    L "  endpoint : $url"
+    [ -n "${LLM_HOST:-}" ] && L "  host     : $LLM_HOST (via Header)"
+
+    local host_arg=()
+    if [ -n "${LLM_HOST:-}" ]; then
+        host_arg=(-H "Host: $LLM_HOST")
+    fi
+
+    local tmp code
+    tmp=$(mktemp)
+    code=$(curl -sS -o "$tmp" -w '%{http_code}' \
+        --connect-timeout 5 --max-time "$LLM_TIMEOUT" \
+        "${host_arg[@]}" \
+        -X POST "$url" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${LLM_API_KEY}" \
+        -d "{\"model\":\"${LLM_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"temperature\":0.1}" \
+        2>/dev/null || true)
+
+    local body; body=$(cat "$tmp" 2>/dev/null || true); rm -f "$tmp"
+
+    if [ "${code:-000}" = "200" ]; then
+        L "  ✅ Host -> LLM 连通正常 (HTTP 200)"
+    else
+        W "  ⚠️ Host -> LLM 异常 (HTTP ${code:-000})"
+        [ -n "$body" ] && W "  body: $(printf '%s' "$body" | head -c 300)"
+        W "  (若目标是内网 IP，请检查本地 VPN 或路由)"
+    fi
+}
+
+# ============================================================
+# 0-B. Pod 层深度探针预检
+# ============================================================
+run_probe_pod() {
+    local name=$1
+    local target=$2
+    
+    kubectl -n "$NS" delete pod "$name" --ignore-not-found >/dev/null 2>&1
+    
+    export PROBE_POD_NAME="$name"
+    export PROBE_TARGET="$target"
+    
+    local probe_tmp
+    probe_tmp=$(mktemp)
+    _render_file "$PROBE_TPL" "$probe_tmp"
+    
+    if ! kubectl apply -f "$probe_tmp" >/dev/null; then
+        W "  无法创建探针 Pod ($name)，请检查前置资源 (ConfigMap/Secret) 是否就绪"
+        rm -f "$probe_tmp"
+        return 1
+    fi
+    rm -f "$probe_tmp"
+
+    if kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded pod/"$name" --timeout=30s >/dev/null 2>&1; then
+        kubectl -n "$NS" logs "$name"
+        kubectl -n "$NS" delete pod "$name" >/dev/null 2>&1
+        return 0
+    else
+        kubectl -n "$NS" logs "$name" 2>/dev/null || true
+        kubectl -n "$NS" delete pod "$name" >/dev/null 2>&1
+        return 1
+    fi
+}
+
+precheck_pod_all() {
+    local skip_infra=${1:-false}
+    
+    L "Running In-Cluster deep pre-check..."
+    
+    # 无论如何，LLM 是外部服务，必须检查
+    if run_probe_pod "cca-probe-llm" "llm"; then
+        L "  ✅ Pod -> LLM 连通正常"
+    else
+        W "  ⚠️ Pod -> LLM 异常 (请查看上方探针日志)"
+        [ "${PRECHECK_STRICT:-0}" = "1" ] && exit 1
+    fi
+
+    if [ "$skip_infra" = "true" ]; then
+        L "  ⏭️  Dev mode: Skipping PG and TEI pre-checks (infrastructure will be recreated)"
+    else
+        if run_probe_pod "cca-probe-pg" "pg"; then
+            L "  ✅ Pod -> PG 连通正常"
+        else
+            W "  ⚠️ Pod -> PG 异常 (请查看上方探针日志)"
+            [ "${PRECHECK_STRICT:-0}" = "1" ] && exit 1
+        fi
+
+        if run_probe_pod "cca-probe-tei" "tei"; then
+            L "  ✅ Pod -> TEI 连通正常"
+        else
+            W "  ⚠️ Pod -> TEI 异常 (请查看上方探针日志)"
+            [ "${PRECHECK_STRICT:-0}" = "1" ] && exit 1
+        fi
+    fi
+}
+
+# ============================================================
+# 0-C. 统一预检调度
+# ============================================================
+precheck_infra() {
+    # 接收参数：true 表示跳过 PG/TEI 检查
+    local skip_infra=${1:-false}
+    
+    # 1. 宿主机极速探路
+    precheck_host_llm
+    
+    # 2. 检查必要文件是否已生成
+    if [ ! -f "$OUT/03-configmap.yaml" ] || [ ! -f "$OUT/02-secret-app.yaml" ] || [ ! -f "$OUT/03c-probe-script.yaml" ] || [ ! -f "$PROBE_TPL" ]; then
+        W "配置未渲染或缺少探针资源，跳过集群内深度预检。"
+        return 0
+    fi
+    
+    # 3. 提前创建 Namespace 和基础配置 (确保探针 Pod 有环境可跑)
+    L "Ensuring namespaces and base configs exist for in-cluster pre-check..."
+    
+    kubectl apply -f "$OUT/00-namespace-app.yaml" >/dev/null 2>&1 || true
+    if [ "${SKIP_INFRA:-0}" != "1" ] && [ -f "$OUT/00-namespace-infra.yaml" ]; then
+        kubectl apply -f "$OUT/00-namespace-infra.yaml" >/dev/null 2>&1 || true
+    fi
+    
+    sleep 1
+    
+    kubectl apply -f "$OUT/02-secret-app.yaml" >/dev/null 2>&1 || true
+    kubectl apply -f "$OUT/03-configmap.yaml" >/dev/null 2>&1 || true
+    kubectl apply -f "$OUT/03c-probe-script.yaml" >/dev/null 2>&1 || true
+
+    echo "----------------------------------------------------"
+    # 4. K8s 集群内深度网络排查
+    precheck_pod_all "$skip_infra"
+    echo "----------------------------------------------------"
+}
+
+# ============================================================
+# 1. Render
 # ============================================================
 _render_file() {
     local f=$1 d=$2
     if command -v envsubst >/dev/null 2>&1; then
-        envsubst < "$f" > "$d"; return
+        envsubst < "$f" > "$d"
+        return
     fi
-    local c p v
-    c=$(<"$f")
-    for p in $(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "$f" | sort -u); do
-        v="${p#\$\{}"; v="${v%\}}"
+    
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import os, re, sys
+with open(sys.argv[1]) as fp: content = fp.read()
+content = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", lambda m: os.environ.get(m.group(1) or m.group(2), ""), content)
+with open(sys.argv[2], "w") as fp: fp.write(content)
+' "$f" "$d"
+        return
+    fi
+    
+    W "没有 envsubst 和 python3，使用基础 shell 替换..."
+    local c p v; c=$(<"$f")
+    for p in $(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*' "$f" | sort -u); do
+        v="${p#\$}"; v="${v#\{}"; v="${v%\}}"
         c="${c//$p/${!v-}}"
     done
     printf '%s\n' "$c" > "$d"
 }
+
 render() {
-    L "render → manifests/runtime/"
+    L "Rendering manifests -> manifests/runtime/"
     [ -d "$TPL" ] || { echo "ERROR: 模板目录不存在: $TPL" >&2; exit 1; }
-    rm -rf "$OUT"
-    mkdir -p "$OUT/upload"
-    local f
-    for f in "$TPL"/*.yaml;        do [ -f "$f" ] && _render_file "$f" "$OUT/$(basename "$f")";        done
-    for f in "$TPL"/upload/*.yaml; do [ -f "$f" ] && _render_file "$f" "$OUT/upload/$(basename "$f")"; done
-    L "  ✅ $(find "$OUT" -name '*.yaml' | wc -l | tr -d ' ') 文件"
+    [ -n "$OUT" ] && [ "$OUT" != "/" ] || { echo "ERROR: OUT 非法: '$OUT'" >&2; exit 1; }
+    
+    rm -rf "$OUT" && mkdir -p "$OUT/upload"
+    
+    for f in "$TPL"/*.yaml; do 
+        [ -f "$f" ] || continue
+        _render_file "$f" "$OUT/$(basename "$f")"
+    done
+    
+    for f in "$TPL"/upload/*.yaml; do 
+        [ -f "$f" ] || continue
+        _render_file "$f" "$OUT/upload/$(basename "$f")"
+    done
+
+    if [ -f "$DIR/prompts.yaml" ]; then
+        L "  Generating cca-prompts ConfigMap from root prompts.yaml"
+        kubectl create configmap cca-prompts \
+            --from-file=prompts.yaml="$DIR/prompts.yaml" \
+            --namespace="$NS" \
+            --dry-run=client -o yaml > "$OUT/03b-prompts.yaml"
+    else
+        W "  ⚠️ 根目录未找到 prompts.yaml，跳过 cca-prompts 生成！"
+        echo "" > "$OUT/03b-prompts.yaml"
+    fi
+
+    if [ -f "$DIR/healthcheck.py" ]; then
+        L "  Generating cca-probe-script ConfigMap from root healthcheck.py"
+        kubectl create configmap cca-probe-script \
+            --from-file=healthcheck.py="$DIR/healthcheck.py" \
+            --namespace="$NS" \
+            --dry-run=client -o yaml > "$OUT/03c-probe-script.yaml"
+    else
+        W "  ⚠️ 根目录未找到 healthcheck.py，跳过探针脚本生成！"
+        echo "" > "$OUT/03c-probe-script.yaml"
+    fi
+    
+    for f in "$OUT"/*.yaml; do 
+        [ -s "$f" ] || [[ "$(basename "$f")" == "03b-prompts.yaml" || "$(basename "$f")" == "03c-probe-script.yaml" ]] || { echo "ERROR: 渲染结果为空: $f" >&2; exit 1; }
+    done
+    L "  ✅ 渲染完成"
 }
 
 # ============================================================
-# upload（智能跳过：模型/数据已在 PVC 就不碰对应服务）
+# 2. Upload
 # ============================================================
 upload() {
-    L "upload"
-    local need_model=1 need_data=1
-    local cnt_local=0 cnt_remote=0
-
-    # SKIP_MODEL_UPLOAD=1（默认/生产模式）→ 直接跳过模型
-    if [ "${SKIP_MODEL_UPLOAD:-0}" = "1" ]; then
-        need_model=0
-        L "  SKIP_MODEL_UPLOAD=1 → 跳过模型上传（infra 团队负责）"
-    fi
-
-    # 探测模型
-    if [ "$need_model" = "1" ] && \
-       kubectl -n "$INFRA_TEI_NS" get deploy "$INFRA_TEI_DEPLOY" >/dev/null 2>&1; then
-        local r
-        r=$(kubectl -n "$INFRA_TEI_NS" get deploy "$INFRA_TEI_DEPLOY" \
-            -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
-        case "${r:-}" in ""|"null") r=0;; esac
-        if [ "$r" -ge 1 ] && \
-           kubectl -n "$INFRA_TEI_NS" exec deploy/"$INFRA_TEI_DEPLOY" -- \
-               test -f "/data/models/$MODEL_SHORT_NAME/config.json" >/dev/null 2>&1; then
-            need_model=0
-            L "  模型已就绪 ($MODEL_SHORT_NAME) → 跳过"
-        fi
-    fi
-
-    # 探测数据
-    [ -d "$DATA_DIR_LOCAL" ] && \
-        cnt_local=$(find "$DATA_DIR_LOCAL" -maxdepth 1 -name "$CALLS_FILE_PATTERN" | wc -l | tr -d ' ')
-    if [ "$cnt_local" -gt 0 ] && kubectl -n "$NS" get deploy cca-app >/dev/null 2>&1; then
-        local r
-        r=$(kubectl -n "$NS" get deploy cca-app -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
-        case "${r:-}" in ""|"null") r=0;; esac
-        if [ "$r" -ge 1 ]; then
-            cnt_remote=$(kubectl -n "$NS" exec deploy/cca-app -- \
-                sh -c "find /app/data/$DATA_DIR_BATCH -maxdepth 1 -name '$CALLS_FILE_PATTERN' 2>/dev/null | wc -l" \
-                2>/dev/null | tr -d ' ' || echo 0)
-            if [ "${cnt_remote:-0}" = "$cnt_local" ]; then
-                need_data=0
-                L "  数据已就绪 ($cnt_remote/$cnt_local) → 跳过"
-            fi
-        fi
-    fi
-
-    # 都就绪：直接返回
-    if [ "$need_model" = "0" ] && [ "$need_data" = "0" ]; then
-        L "  ✅ 模型和数据均已在 PVC，跳过 upload"
-        return 0
-    fi
-
-    # 建基础资源
+    L "Uploading assets to PVC..."
     kubectl apply -f "$OUT/00-namespace-app.yaml" >/dev/null
     kubectl apply -f "$OUT/01-pvc-app.yaml" >/dev/null
-    if [ "${SKIP_INFRA:-0}" != "1" ] && [ "$need_model" = "1" ]; then
+    if [ "${SKIP_INFRA:-0}" != "1" ] && [ "${SKIP_MODEL_UPLOAD:-0}" != "1" ]; then
         kubectl apply -f "$OUT/00-namespace-infra.yaml" >/dev/null
         kubectl apply -f "$OUT/01-pvc-infra.yaml" >/dev/null
     fi
 
-    local orig_app=0 orig_tei=0
-
-    # 停 app（只有需要传数据时）
-    if [ "$need_data" = "1" ]; then
-        if kubectl -n "$NS" get deploy cca-app >/dev/null 2>&1; then
-            orig_app=$(kubectl -n "$NS" get deploy cca-app -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)
-        fi
-        case "${orig_app:-}" in ""|"null") orig_app=0;; esac
-        if [ "$orig_app" -gt 0 ]; then
-            L "  暂停 app ($orig_app → 0，为上传数据)"
-            kubectl -n "$NS" scale deploy/cca-app --replicas=0 >/dev/null
-            kubectl -n "$NS" wait --for=delete pod -l app=cca-app --timeout=120s 2>/dev/null || true
-        fi
-    fi
-
-    # 停 TEI（只有需要传模型时）
-    if [ "$need_model" = "1" ]; then
-        if kubectl -n "$INFRA_TEI_NS" get deploy "$INFRA_TEI_DEPLOY" >/dev/null 2>&1; then
-            orig_tei=$(kubectl -n "$INFRA_TEI_NS" get deploy "$INFRA_TEI_DEPLOY" \
-                -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)
-        fi
-        case "${orig_tei:-}" in ""|"null") orig_tei=0;; esac
-        if [ "$orig_tei" -gt 0 ]; then
-            L "  暂停 TEI ($orig_tei → 0，为上传模型)"
-            kubectl -n "$INFRA_TEI_NS" scale deploy/"$INFRA_TEI_DEPLOY" --replicas=0 >/dev/null
-            kubectl -n "$INFRA_TEI_NS" wait --for=delete pod -l "app=$INFRA_TEI_LABEL" --timeout=120s 2>/dev/null || true
-        fi
-    fi
-
-    # 起 upload pod（只起需要的）
-    L "  起 upload pods"
-    if [ "$need_model" = "1" ]; then
-        kubectl -n "$INFRA_TEI_NS" delete pod tei-upload --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    if [ "${SKIP_MODEL_UPLOAD:-0}" != "1" ] && [ -d "$HF_CACHE_DIR" ]; then
+        L "  同步模型到 TEI PVC..."
+        kubectl -n "$INFRA_TEI_NS" delete pod tei-upload --ignore-not-found --wait=true >/dev/null 2>&1
         kubectl apply -f "$OUT/upload/tei-upload.yaml" >/dev/null
-        kubectl -n "$INFRA_TEI_NS" wait --for=condition=Ready pod/tei-upload --timeout=180s >/dev/null
+        kubectl -n "$INFRA_TEI_NS" wait --for=condition=Ready pod/tei-upload --timeout=120s >/dev/null
+        
+        local snap_dir="$HF_CACHE_DIR/hub/models--BAAI--bge-base-zh-v1.5"
+        if [ -d "$snap_dir" ]; then
+            kubectl -n "$INFRA_TEI_NS" exec tei-upload -- mkdir -p "/data/models/$MODEL_SHORT_NAME"
+            tar -chf - -C "$snap_dir" . | kubectl -n "$INFRA_TEI_NS" exec -i tei-upload -- tar -xf - -C "/data/models/$MODEL_SHORT_NAME/"
+        fi
+        kubectl -n "$INFRA_TEI_NS" delete pod tei-upload --wait=true >/dev/null 2>&1
     fi
-    if [ "$need_data" = "1" ]; then
-        kubectl -n "$NS" delete pod app-upload --ignore-not-found --wait=true >/dev/null 2>&1 || true
+
+    if [ -d "$DATA_DIR_LOCAL" ]; then
+        L "  同步业务数据到 App PVC (批次 $DATA_BATCH)..."
+        kubectl -n "$NS" delete pod app-upload --ignore-not-found --wait=true >/dev/null 2>&1
         kubectl apply -f "$OUT/upload/app-upload.yaml" >/dev/null
-        kubectl -n "$NS" wait --for=condition=Ready pod/app-upload --timeout=180s >/dev/null
-    fi
+        kubectl -n "$NS" wait --for=condition=Ready pod/app-upload --timeout=120s >/dev/null
 
-    # 上传模型
-    if [ "$need_model" = "1" ]; then
-        if [ -d "$HF_CACHE_DIR/hub/$MODEL_DIR_NAME" ]; then
-            local snap_dir="$HF_CACHE_DIR/hub/$MODEL_DIR_NAME" snap_hash=""
-            [ -f "$snap_dir/refs/main" ] && snap_hash=$(cat "$snap_dir/refs/main" | tr -d '\n')
-            if [ -z "$snap_hash" ] || [ ! -d "$snap_dir/snapshots/$snap_hash" ]; then
-                snap_hash=$(ls "$snap_dir/snapshots/" 2>/dev/null | head -1 || echo "")
-            fi
-            if [ -n "$snap_hash" ] && [ -d "$snap_dir/snapshots/$snap_hash" ]; then
-                local src="$snap_dir/snapshots/$snap_hash"
-                L "  模型: $MODEL_SHORT_NAME (snapshot $snap_hash, $(du -sh "$src" 2>/dev/null | cut -f1))"
-                kubectl -n "$INFRA_TEI_NS" exec tei-upload -- mkdir -p "/data/models/$MODEL_SHORT_NAME"
-                kubectl -n "$INFRA_TEI_NS" exec tei-upload -- \
-                    sh -c "rm -rf /data/models/$MODEL_SHORT_NAME/* 2>/dev/null || true"
-                tar -chf - -C "$src" . \
-                    | kubectl -n "$INFRA_TEI_NS" exec -i tei-upload -- \
-                        tar -xf - -C "/data/models/$MODEL_SHORT_NAME/"
-                local has_cfg has_w
-                has_cfg=$(kubectl -n "$INFRA_TEI_NS" exec tei-upload -- \
-                    test -f "/data/models/$MODEL_SHORT_NAME/config.json" && echo y || echo n)
-                has_w=$(kubectl -n "$INFRA_TEI_NS" exec tei-upload -- \
-                    sh -c "test -f /data/models/$MODEL_SHORT_NAME/pytorch_model.bin -o -f /data/models/$MODEL_SHORT_NAME/model.safetensors && echo y || echo n")
-                [ "$has_cfg" = "y" ] && [ "$has_w" = "y" ] \
-                    || W "模型不完整: config=$has_cfg weights=$has_w"
-                kubectl -n "$INFRA_TEI_NS" exec tei-upload -- du -sh "/data/models/$MODEL_SHORT_NAME"
-            else
-                W "找不到模型的 snapshot: $snap_dir"
-            fi
-        else
-            W "本地模型不存在: $HF_CACHE_DIR/hub/$MODEL_DIR_NAME（跳过）"
-        fi
+        kubectl -n "$NS" exec app-upload -- mkdir -p "/app/data/$DATA_BATCH"
+        tar -cf - -C "$DATA_DIR_LOCAL" . | kubectl -n "$NS" exec -i app-upload -- tar -xf - -C "/app/data/$DATA_BATCH/"
+        kubectl -n "$NS" delete pod app-upload --wait=true >/dev/null 2>&1
     fi
-
-    # 上传数据
-    if [ "$need_data" = "1" ] && [ -d "$DATA_DIR_LOCAL" ]; then
-        local b="$DATA_DIR_BATCH" cnt="$cnt_local" rc
-        if [ "$cnt" -gt 0 ]; then
-            L "  数据: → /app/data/$b/ ($cnt 个)"
-            kubectl -n "$NS" exec app-upload -- mkdir -p "/app/data/$b"
-            kubectl -n "$NS" exec app-upload -- sh -c \
-                "find /app/data/$b -maxdepth 1 -name '$CALLS_FILE_PATTERN' -delete 2>/dev/null || true"
-            tar -cf - -C "$DATA_DIR_LOCAL" . \
-                | kubectl -n "$NS" exec -i app-upload -- tar -xf - -C "/app/data/$b/"
-            rc=$(kubectl -n "$NS" exec app-upload -- \
-                sh -c "find /app/data/$b -maxdepth 1 -name '$CALLS_FILE_PATTERN' | wc -l" | tr -d ' ')
-            [ "$rc" = "$cnt" ] || W "文件数不一致: 本地 $cnt / 远端 $rc"
-        else
-            W "$DATA_DIR_LOCAL 下无 $CALLS_FILE_PATTERN"
-        fi
-    fi
-
-    # 清理 + 恢复
-    [ "$need_model" = "1" ] && kubectl -n "$INFRA_TEI_NS" delete pod tei-upload --wait=true >/dev/null 2>&1 || true
-    [ "$need_data" = "1" ]  && kubectl -n "$NS" delete pod app-upload --wait=true >/dev/null 2>&1 || true
-    if [ "$orig_tei" -gt 0 ]; then
-        L "  恢复 TEI ($orig_tei)"
-        kubectl -n "$INFRA_TEI_NS" scale deploy/"$INFRA_TEI_DEPLOY" --replicas="$orig_tei" >/dev/null
-    fi
-    if [ "$orig_app" -gt 0 ]; then
-        L "  恢复 app ($orig_app)"
-        kubectl -n "$NS" scale deploy/cca-app --replicas="$orig_app" >/dev/null
-    fi
-    L "  ✅"
+    L "  ✅ 上传完成"
 }
 
 # ============================================================
-# up（智能重启：配置 hash 未变则不重启 app）
+# 3. Up
 # ============================================================
 up() {
-    L "apply manifests"
-
-    # 记录 apply 前 ConfigMap/Secret 的 hash
-    local hash_before=""
-    if kubectl -n "$NS" get cm cca-config >/dev/null 2>&1; then
-        hash_before=$(kubectl -n "$NS" get cm cca-config -o yaml 2>/dev/null | sha256sum | cut -d' ' -f1)
-        hash_before="$hash_before:$(kubectl -n "$NS" get secret cca-secret -o yaml 2>/dev/null | sha256sum | cut -d' ' -f1)"
-    fi
-
-    # ---- app 资源（总是应用） ----
+    L "Applying Kubernetes manifests..."
     kubectl apply -f "$OUT/00-namespace-app.yaml" >/dev/null
     kubectl apply -f "$OUT/01-pvc-app.yaml" >/dev/null
     kubectl apply -f "$OUT/02-secret-app.yaml" >/dev/null
     kubectl apply -f "$OUT/03-configmap.yaml" >/dev/null
+    
+    if [ -s "$OUT/03b-prompts.yaml" ]; then
+        kubectl apply -f "$OUT/03b-prompts.yaml" >/dev/null
+    fi
 
-    # ---- infra 资源（默认跳过，dev 才部署） ----
     if [ "${SKIP_INFRA:-0}" = "1" ]; then
-        L "  SKIP_INFRA=1 → 跳过 PG/TEI 部署（使用已有 Service）"
+        L "  SKIP_INFRA=1 → 跳过 PG/TEI 部署"
     else
         kubectl apply -f "$OUT/00-namespace-infra.yaml" >/dev/null
         kubectl apply -f "$OUT/01-pvc-infra.yaml" >/dev/null
@@ -279,149 +317,116 @@ up() {
         kubectl apply -f "$OUT/05-tei.yaml" >/dev/null
     fi
 
-    # ---- app 本体 ----
     kubectl apply -f "$OUT/06-app.yaml" >/dev/null
 
-    # prompts
-    if [ -f "$DIR/../../prompts.yaml" ]; then
-        kubectl -n "$NS" create configmap cca-prompts \
-            --from-file=prompts.yaml="$DIR/../../prompts.yaml" \
-            --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    if [ "${SKIP_INFRA:-0}" != "1" ]; then
+        L "  等待 PostgreSQL 就绪..."
+        kubectl -n "$INFRA_PG_NS" wait --for=condition=Ready pod/postgres-0 --timeout=180s >/dev/null
+        L "  等待 TEI 就绪..."
+        kubectl -n "$INFRA_TEI_NS" wait --for=condition=available deploy/"$INFRA_TEI_DEPLOY" --timeout=300s >/dev/null
     fi
 
-    # ---- hash 比对 ----
-    local hash_after=""
-    if kubectl -n "$NS" get cm cca-config >/dev/null 2>&1; then
-        hash_after=$(kubectl -n "$NS" get cm cca-config -o yaml 2>/dev/null | sha256sum | cut -d' ' -f1)
-        hash_after="$hash_after:$(kubectl -n "$NS" get secret cca-secret -o yaml 2>/dev/null | sha256sum | cut -d' ' -f1)"
-    fi
-
-    if [ "${FORCE_RESTART:-0}" = "1" ] || [ "$hash_before" != "$hash_after" ] || [ -z "$hash_before" ]; then
-        L "  重启 app（配置变化或强制）"
-        kubectl -n "$NS" rollout restart deploy/cca-app >/dev/null
-    else
-        L "  配置未变 → 跳过 app 重启"
-    fi
-
-    # ---- 等待 infra 就绪（只读） ----
-    L "  等待 postgres"
-    kubectl -n "$INFRA_PG_NS" wait --for=condition=ready pod/postgres-0 --timeout=180s >/dev/null
-    L "  等待 TEI"
-    kubectl -n "$INFRA_TEI_NS" wait --for=condition=available deploy/"$INFRA_TEI_DEPLOY" --timeout=600s >/dev/null
-
-    # ---- 等待 app 就绪 ----
-    L "  等待 app"
+    L "  等待 App 启动..."
     kubectl -n "$NS" rollout status deploy/cca-app --timeout=300s
-    L "  ✅"
+    L "  ✅ 部署成功"
 }
 
 # ============================================================
-# pf
+# 4. Port-Forward
 # ============================================================
 pf_stop() {
-    local p
     if [ -f "$PF_PID" ]; then
-        p=$(cat "$PF_PID" 2>/dev/null || true)
-        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+        kill "$(cat "$PF_PID" 2>/dev/null)" 2>/dev/null || true
         rm -f "$PF_PID"
     fi
-    pkill -f "kubectl.*port-forward.*-n $NS.*cca-app" 2>/dev/null || true
+    pkill -f "kubectl.*-n ${NS}.*port-forward.*svc/cca-app" 2>/dev/null || true
 }
+
 pf() {
     pf_stop
-    L "port-forward $PF_ADDRESS:$PF_PORT"
+    L "Starting port-forward -> http://$PF_ADDRESS:$PF_PORT"
     : > "$PF_LOG"
-    nohup kubectl -n "$NS" port-forward --address "$PF_ADDRESS" \
-        svc/cca-app "$PF_PORT:8000" >> "$PF_LOG" 2>&1 &
+    nohup kubectl -n "$NS" port-forward --address "$PF_ADDRESS" svc/cca-app "$PF_PORT:8000" >> "$PF_LOG" 2>&1 &
     echo $! > "$PF_PID"
-    local i
-    for i in $(seq 1 30); do
+    
+    for _ in {1..15}; do
         if curl -sf -o /dev/null --max-time 2 "http://$PF_ADDRESS:$PF_PORT/health" 2>/dev/null; then
-            L "  ✅ http://$PF_ADDRESS:$PF_PORT"
-            return
+            L "  ✅ 端口转发已就绪"
+            return 0
         fi
         sleep 1
     done
-    W "pf 30s 未就绪，日志: $PF_LOG"
+    W "端口转发启动较慢或健康检查未响应，请检查日志: $PF_LOG"
 }
 
 # ============================================================
-# offline（停 app → 跑 Job → 恢复 app → 重启 pf）
+# 5. Offline
 # ============================================================
 offline() {
     pf_stop
-    local orig=1
-    if kubectl -n "$NS" get deploy cca-app >/dev/null 2>&1; then
-        orig=$(kubectl -n "$NS" get deploy cca-app -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 1)
-    fi
-    case "${orig:-}" in ""|"null") orig=1;; esac
-
-    L "  暂停 app ($orig → 0)"
-    kubectl -n "$NS" scale deploy/cca-app --replicas=0 2>/dev/null || true
-    kubectl -n "$NS" wait --for=delete pod -l app=cca-app --timeout=120s 2>/dev/null || true
-
-    L "  运行 Job"
-    kubectl -n "$NS" delete job cca-offline --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    L "Running offline pipeline job..."
+    kubectl -n "$NS" delete job cca-offline --ignore-not-found --wait=true >/dev/null 2>&1
     kubectl apply -f "$OUT/07-offline-job.yaml" >/dev/null
     kubectl -n "$NS" logs -f job/cca-offline 2>/dev/null || true
-
-    local ok=0
-    kubectl -n "$NS" wait --for=condition=complete job/cca-offline --timeout=1800s >/dev/null 2>&1 \
-        && ok=1 || W "Job 失败/超时"
-
-    L "  恢复 app ($orig)"
-    kubectl -n "$NS" scale deploy/cca-app --replicas="$orig" >/dev/null
-    kubectl -n "$NS" rollout status deploy/cca-app --timeout=180s >/dev/null 2>&1 || true
-    pf || true
-
-    [ "$ok" = "1" ] && L "  ✅" || return 1
+    kubectl -n "$NS" wait --for=condition=complete job/cca-offline --timeout=1800s >/dev/null
+    pf
+    L "  ✅ 离线建库完成"
 }
 
 # ============================================================
-# status
+# 6. Status
 # ============================================================
 status() {
-    local n
     for n in "$INFRA_PG_NS" "$INFRA_TEI_NS" "$NS"; do
-        echo ""; echo "=== $n ==="
-        kubectl -n "$n" get pods,svc 2>/dev/null || echo "  (无)"
+        echo ""; echo "=== Namespace: $n ==="
+        kubectl -n "$n" get pods,svc,jobs 2>/dev/null || echo "  (无资源)"
     done
     echo ""
-    if [ -f "$PF_PID" ] && kill -0 "$(cat "$PF_PID" 2>/dev/null || echo 0)" 2>/dev/null; then
-        echo "PF: Running → http://$PF_ADDRESS:$PF_PORT"
+    if [ -f "$PF_PID" ] && kill -0 "$(cat "$PF_PID" 2>/dev/null)" 2>/dev/null; then
+        echo "Port-Forward: Running → http://$PF_ADDRESS:$PF_PORT"
     else
-        echo "PF: Not running"
+        echo "Port-Forward: Not running"
     fi
 }
 
 # ============================================================
-# 分发
+# 入口分发
 # ============================================================
 case "${1:-prod}" in
-    # 默认 = 生产部署：跳过 infra + 跳过模型
     prod)
-        SKIP_INFRA=1 SKIP_MODEL_UPLOAD=1
-        render; upload; up; offline; pf
+        render
+        precheck_infra false
+        export SKIP_INFRA=1 SKIP_MODEL_UPLOAD=1
+        upload; up; offline; pf
         ;;
-    # dev = 完整部署：本地/测试环境
     dev)
-        render; upload; up; offline; pf
+        render
+        # 传入 true 表示跳过 PG 和 TEI 预检
+        precheck_infra true
+        upload; up; offline; pf
         ;;
-    online)   render; up; pf ;;
+    online)
+        render
+        precheck_infra false
+        up; pf
+        ;;
     render)   render ;;
-    upload)   render; upload ;;
-    up)       render; up ;;
-    offline)  render; offline ;;
+    precheck) 
+        render
+        # 支持 ./start.sh precheck skip-infra
+        if [ "${2:-}" = "skip-infra" ]; then
+            precheck_infra true
+        else
+            precheck_infra false
+        fi
+        ;;
+    up)       up ;;
+    offline)  offline ;;
     pf)       pf ;;
-    pf-stop)  pf_stop; L "pf 已停" ;;
+    pf-stop)  pf_stop; L "Port-forward 已停止" ;;
     status)   status ;;
-    help|-h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     *)
-        echo "用法: $0 [prod|dev|online|render|upload|up|offline|pf|pf-stop|status]" >&2
-        echo "" >&2
-        echo "  (无参数)    生产部署：跳过 infra + 跳过模型（默认）" >&2
-        echo "  dev         完整部署：本地/测试环境" >&2
-        echo "  online      只部署服务（迭代用）" >&2
+        echo "用法: $0 [prod|dev|online|render|precheck [skip-infra]|up|offline|pf|pf-stop|status]" >&2
         exit 1
         ;;
 esac

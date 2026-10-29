@@ -111,6 +111,32 @@ jobs:
           provenance: false
           sbom: false
 
+      - name: Package scripts folder
+        if: ${{ matrix.arch_suffix == 'amd64' && (github.event_name != 'workflow_dispatch' || inputs.export_tar) }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import os, zipfile
+          exclude = {'.env', '.pf.log'}          # secrets / local runtime logs
+          with zipfile.ZipFile('saleschat-scripts.zip', 'w', zipfile.ZIP_DEFLATED) as zf:
+              for root, _, files in os.walk('scripts'):
+                  for f in files:
+                      if f in exclude:
+                          continue
+                      p = os.path.join(root, f)
+                      zf.write(p, os.path.relpath(p, '.'))
+          PY
+          ls -la saleschat-scripts.zip
+
+      - name: Upload Scripts Artifact
+        if: ${{ matrix.arch_suffix == 'amd64' && (github.event_name != 'workflow_dispatch' || inputs.export_tar) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: saleschat-scripts
+          path: saleschat-scripts.zip
+          retention-days: 3
+          if-no-files-found: error
+
       - name: Upload Tar Artifact
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.export_tar }}
         uses: actions/upload-artifact@v4

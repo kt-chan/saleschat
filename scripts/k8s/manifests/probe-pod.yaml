@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${PROBE_POD_NAME}
+  namespace: ${NS}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: ${APP_IMAGE}
+    imagePullPolicy: Never
+    command: ["python3", "/app/healthcheck.py", "${PROBE_TARGET}"]
+    envFrom:
+      - configMapRef:
+          name: cca-config
+      - secretRef:
+          name: cca-secret
+    volumeMounts:
+      - name: healthcheck-script
+        mountPath: /app/healthcheck.py
+        subPath: healthcheck.py
+  volumes:
+    - name: healthcheck-script
+      configMap:
+        name: cca-probe-script
