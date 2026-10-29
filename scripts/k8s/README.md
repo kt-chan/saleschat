@@ -1,10 +1,3 @@
-结合你提供的最新参考文档（详细的生产/开发模式区分、`stop.sh` 机制、场景速查），以及我们最近讨论的**双层网络预检（Host + Pod）**、**原生 requests LLM 客户端**、**动态探针注入**等架构，我为你重新整合并输出了这份完整、生产级的 `README.md`。
-
-这份文档将是你项目唯一的“真理来源”。
-
----
-
-```markdown
 # SalesChat / CCA Kubernetes 部署与运维指南
 
 本项目采用 `start.sh` / `stop.sh` 双脚本方案，实现了从本地开发到  内网生产的全流程闭环。零外部强依赖（`envsubst` 可选，自带 Python 降级替换），集成了 **双层网络探针（Host + Pod）** 和 **动态文件注入**，确保在高度隔离的内网环境下也能一键部署。
@@ -324,4 +317,3 @@ kubectl -n cca exec $POD -- env | grep -E "DB_|LLM_|EMBEDDING_|DATA_DIR"
 | **清 cca 数据重建** | `./stop.sh --purge && ./start.sh` |
 | **看状态** | `./start.sh status` |
 | **看日志** | `kubectl -n cca logs -f deploy/cca-app` |
-```
