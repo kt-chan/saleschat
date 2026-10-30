@@ -27,7 +27,7 @@ services:
   # PostgreSQL —— 独立容器，无 pgvector
   # ============================================================
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:0.8.2-pg16
     container_name: cca-postgres
     restart: unless-stopped
     environment:

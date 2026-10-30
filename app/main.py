@@ -7,7 +7,6 @@ from app.logger import get_logger
 from app.utils import init_db, clear_system_data, parse_dialog
 from app.offline import load_calls, LLMLabeler, PgvectorWriter, GoldenScriptGenerator
 from app.online import HybridRetriever, get_retriever, suggest_script_for_conversation
-from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _env_path = PROJECT_ROOT / ".env"
@@ -15,10 +14,11 @@ _env_path = PROJECT_ROOT / ".env"
 if _env_path.is_file():
     try:
         from dotenv import load_dotenv
-        load_dotenv(_env_path)          # override=False: YAML envs: still win
+
+        load_dotenv(_env_path)
     except ImportError:
-        pass                            # offline image without python-dotenv
-    
+        pass
+
 log = get_logger(__name__)
 retriever: Optional[HybridRetriever] = None
 
@@ -60,25 +60,21 @@ def offline_pipeline():
     total_calls = 0
     total_pairs = 0
 
-    # 阶段 1–3 合并：流式解析 → 双级打标 → 向量入库
     log.info("=== 阶段1-3: 流式解析 → LLM 双级打标 → 向量化入库 ===")
-    for idx, batch in enumerate(
-        load_calls(cfg.data_dir, cfg.calls_file_pattern), 1
-    ):
+    for idx, batch in enumerate(load_calls(cfg.data_dir, cfg.calls_file_pattern), 1):
         batche_num = idx
         total_calls += len(batch)
         log.info(f"[批次 {idx}] {len(batch)} 通 calls")
 
         sessions = pairs = None
         try:
-            sessions = labeler.run_sessions(batch)       # 首写截断，后续追加
-            pairs = labeler.run_pairs(batch, sessions)   # 同上
+            sessions = labeler.run_sessions(batch)
+            pairs = labeler.run_pairs(batch, sessions)
             total_pairs += len(pairs or [])
-            writer.write(pairs, sessions)                # 每批独立 commit
+            writer.write(pairs, sessions)
         except Exception as e:
             log.exception(f"[批次 {idx}] 处理失败: {e}")
         finally:
-            # 主动断开引用，让本批内存被 GC 回收
             del batch, sessions, pairs
 
     if batche_num == 0:
@@ -90,7 +86,6 @@ def offline_pipeline():
         f"{total_pairs} 条 pairs 已入库"
     )
 
-    # 阶段 4 保持不变：读取 pgvector 中已完成的全量数据构建 SOP 图
     log.info("=== 阶段4: 图谱合成经典 Q&A (自动落盘) ===")
     graph = GoldenScriptGenerator().build_graph()
     with open(cfg.sop_graph_file, "w", encoding="utf-8") as f:
@@ -134,11 +129,11 @@ def online_pipeline(text, label, hint):
     print(f"  📍 Stage:    {res['stage']}")
     print(f"  📍 Intent:   {res['intent']}")
     print(f"  📍 Source:   {res['source']} (score={res['score']})")
-    print(f"  📍 Path:     {d.get('path')} | passes={d.get('passes')}")
-    if d.get("stage_vote_1"):
-        print(
-            f"  📍 Pass 1:   stage={d.get('stage_vote_1')} intent={d.get('intent_vote_1')}"
-        )
+    print(f"  📍 Path:     {d.get('path')} | sub_path={d.get('sub_path')}")
+    if d.get("golden_sim") is not None:
+        print(f"  📍 Golden:   sim={d.get('golden_sim')}")
+    if d.get("top_sim") is not None:
+        print(f"  📍 Top1:     sim={d.get('top_sim')} margin={d.get('margin')}")
     print(f"\n  💬 Script for 催收员:")
     print(f"     {res['script']}")
     if res["question"]:
@@ -172,7 +167,9 @@ def online_demo():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["all", "offline", "online"], default="offline")
+    parser.add_argument(
+        "--mode", choices=["all", "offline", "online"], default="offline"
+    )
     args = parser.parse_args()
     if args.mode == "offline":
         offline_pipeline()

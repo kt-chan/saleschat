@@ -6,8 +6,6 @@ import app.config as raw_config
 from app.settings import get_settings
 from app.logger import get_logger
 from app.utils import (
-    emb_to_bytes,
-    invalidate_embedding_index,
     parallel_map,
     get_db_conn,
     release_db_conn,
@@ -406,7 +404,7 @@ class PgvectorWriter:
                     json.dumps(p["session_outcomes"], ensure_ascii=False),
                     p["rewritten_question"],
                     p["rewritten_answer"],
-                    emb_to_bytes(embs[j]),
+                    embs[j],
                 )
                 for j, p in enumerate(batch)
             ]
@@ -436,7 +434,6 @@ class PgvectorWriter:
                 release_db_conn(conn)
 
         if inserted > 0:
-            invalidate_embedding_index()
             log.info(f"[入库] 本批写入 {inserted} 条，embedding 索引已失效")
 
 

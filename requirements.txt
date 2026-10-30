@@ -27,6 +27,7 @@ rapidfuzz>=3.0.0
 # ==================== PostgreSQL ====================
 # 独立 Docker Postgres，无 pgvector、无 embedded-postgres
 # [binary] 便携 wheel；[pool] 提供 psycopg_pool
+pgvector>=0.2.5
 psycopg[binary,pool]>=3.2.0
 
 # ==================== Web service ====================

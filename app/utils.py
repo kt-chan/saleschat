@@ -8,6 +8,7 @@ import requests
 
 import psycopg
 from psycopg_pool import ConnectionPool
+from pgvector.psycopg import register_vector
 
 from app.logger import get_logger
 from app.settings import get_settings
@@ -42,7 +43,43 @@ def safe_json_loads(text: str) -> dict:
     return {}
 
 
-# ---------------- DB (standalone PostgreSQL, no pgvector) ----------------
+# ---------------- DB (standalone PostgreSQL + pgvector) ----------------
+
+
+def _configure_conn(conn: psycopg.Connection) -> None:
+    """
+    每个连接初始化：
+      1. 确保 vector 扩展存在（幂等 CREATE EXTENSION）
+      2. 注册 vector 类型适配器
+      3. 设置 HNSW 会话参数
+    """
+    # ① 扩展必须先行于 register_vector
+    with conn.cursor() as cur:
+        try:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        except Exception as e:
+            log.warning(
+                f"CREATE EXTENSION vector 失败（可能无权限）: {e}。"
+                f"请用 superuser 执行一次: CREATE EXTENSION vector;"
+            )
+
+    # ② 注册适配器
+    try:
+        register_vector(conn)
+    except Exception as e:
+        log.warning(f"register_vector 失败: {e}")
+
+    # ③ HNSW 参数
+    with conn.cursor() as cur:
+        try:
+            cur.execute("SET hnsw.ef_search = 100")
+            cur.execute("SET hnsw.iterative_scan = 'relaxed_order'")
+        except Exception as e:
+            log.warning(f"HNSW 参数设置失败（pgvector 可能 < 0.8.0）: {e}")
+            try:
+                cur.execute("SET hnsw.ef_search = 100")
+            except Exception:
+                pass
 
 
 def get_db_pool() -> ConnectionPool:
@@ -61,6 +98,7 @@ def get_db_pool() -> ConnectionPool:
         max_size=cfg.db_pool_max,
         open=True,
         kwargs={"autocommit": True},
+        configure=_configure_conn,
     )
     log.info(
         f"PostgreSQL ConnectionPool 初始化完成 "
@@ -89,19 +127,6 @@ def release_db_conn(conn: psycopg.Connection) -> None:
         _db_pool.putconn(conn)
 
 
-# ---------------- embedding <-> BYTEA ----------------
-
-
-def emb_to_bytes(vec: np.ndarray) -> bytes:
-    """numpy 向量 → BYTEA 存储格式（float32 原始字节）。"""
-    return np.asarray(vec, dtype=np.float32).ravel().tobytes()
-
-
-def bytes_to_emb(b: bytes) -> np.ndarray:
-    """BYTEA → numpy 向量（float32）。"""
-    return np.frombuffer(b, dtype=np.float32)
-
-
 # ---------------- DB lifecycle ----------------
 
 
@@ -128,22 +153,22 @@ def clear_system_data() -> None:
     except Exception as e:
         log.warning(f"清空数据库失败: {e}")
 
-    invalidate_embedding_index()
-
 
 def init_db() -> None:
     """
-    初始化表结构（无 pgvector）。
+    初始化表结构（原生 pgvector）。
 
-    embedding 以 BYTEA 存储（float32 原始字节），应用层计算相似度。
-    自动迁移：
-      - 旧 vector 类型 → DROP 重建为 BYTEA（向量丢失，需重新 encode）
-      - 旧 jsonb 类型  → 逐行转为 BYTEA（数据保留）
+    - embedding: vector(768)
+    - HNSW 索引 (cosine)，m=16, ef_construction=64
+    - 不做数据迁移：列类型/维度不符时直接重建列，旧 embedding 丢弃
     """
+    DIM = 768
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+            cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS qa_pairs (
                     id SERIAL PRIMARY KEY,
                     call_id VARCHAR(64),
@@ -155,45 +180,31 @@ def init_db() -> None:
                     session_outcomes JSONB,
                     rewritten_question TEXT NOT NULL,
                     rewritten_answer TEXT NOT NULL,
-                    embedding BYTEA,
+                    embedding vector({DIM}),
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
 
-            # ---- embedding 列类型迁移 ----
+            # ---- embedding 列类型/维度校验（不迁移，直接重建） ----
             cur.execute(
-                "SELECT udt_name FROM information_schema.columns "
-                "WHERE table_name='qa_pairs' AND column_name='embedding';"
+                "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                "WHERE attrelid = 'qa_pairs'::regclass AND attname = 'embedding';"
             )
             row = cur.fetchone()
+            expected = f"vector({DIM})"
             if row is None:
-                cur.execute("ALTER TABLE qa_pairs ADD COLUMN embedding BYTEA;")
-            elif row[0] == "vector":
+                cur.execute(
+                    f"ALTER TABLE qa_pairs ADD COLUMN embedding vector({DIM});"
+                )
+            elif row[0] != expected:
                 log.warning(
-                    "embedding 列为旧 pgvector 类型，DROP 并重建为 BYTEA"
-                    "（旧向量丢失，需重新 encode 后写入）"
+                    f"embedding 列类型为 {row[0]}，期望 {expected}。"
+                    f"按'不迁移'约定重建（旧数据丢弃，需重跑 offline 写入）"
                 )
                 cur.execute("ALTER TABLE qa_pairs DROP COLUMN embedding;")
-                cur.execute("ALTER TABLE qa_pairs ADD COLUMN embedding BYTEA;")
-            elif row[0] == "jsonb":
-                log.info("embedding 列从 JSONB 迁移到 BYTEA ...")
-                cur.execute("ALTER TABLE qa_pairs ADD COLUMN embedding_v2 BYTEA;")
                 cur.execute(
-                    "SELECT id, embedding FROM qa_pairs WHERE embedding IS NOT NULL"
+                    f"ALTER TABLE qa_pairs ADD COLUMN embedding vector({DIM});"
                 )
-                migrate = cur.fetchall()
-                for rid, payload in migrate:
-                    arr = np.asarray(payload, dtype=np.float32)
-                    cur.execute(
-                        "UPDATE qa_pairs SET embedding_v2 = %s WHERE id = %s",
-                        (arr.tobytes(), rid),
-                    )
-                cur.execute("ALTER TABLE qa_pairs DROP COLUMN embedding;")
-                cur.execute(
-                    "ALTER TABLE qa_pairs RENAME COLUMN embedding_v2 TO embedding;"
-                )
-                log.info(f"JSONB → BYTEA 迁移完成 ({len(migrate)} 行)")
-            # bytea：无需处理
 
             # ---- session_ptp 兼容补列 ----
             cur.execute(
@@ -205,215 +216,20 @@ def init_db() -> None:
 
             # ---- 索引 ----
             cur.execute("DROP INDEX IF EXISTS idx_qa_emb;")
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_qa_stage_intent "
-                "ON qa_pairs (stage, primary_intent);"
-            )
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_qa_embedding_hnsw
+                ON qa_pairs USING hnsw (embedding vector_cosine_ops)
+                WITH (m = 16, ef_construction = 64);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_qa_stage_intent
+                ON qa_pairs (stage, primary_intent);
+            """)
 
         conn.commit()
-        log.info("数据库初始化完成（embedding 以 BYTEA 存储，应用层计算相似度）")
+        log.info("数据库初始化完成（embedding: vector(768) + HNSW）")
     finally:
         release_db_conn(conn)
-
-
-# ---------------- 进程级 embedding 索引缓存 ----------------
-
-
-class _EmbeddingIndex:
-    """
-    进程级 embedding 矩阵缓存，替代 pgvector 的 ANN 索引。
-
-    设计要点：
-      - 懒加载：首次访问时全量拉取，之后常驻内存
-      - 预归一化：存储时即归一化，查询时矩阵乘法一次完成
-      - 向量化掩码：stage/intent/risk 预存为 ndarray，过滤用 np.where
-      - 线程安全：加载互斥（RLock），加载完成后读路径无锁
-      - 写后失效：写入侧调用 invalidate_embedding_index()，下次读时重建
-
-    内存估算：N × D × 4 字节。768 维时，10 万行 ≈ 300MB，100 万行 ≈ 3GB。
-    数据量非常大时，建议改用专用向量库（Qdrant / Milvus / FAISS）。
-    """
-
-    def __init__(self):
-        self._lock = threading.RLock()
-        self._loaded = False
-        self._matrix: Optional[np.ndarray] = None  # [N, D] float32 已归一化
-        self._ids: Optional[np.ndarray] = None  # [N] int64
-        self._stages: List[str] = []
-        self._intents: List[str] = []
-        self._payloads: List[Tuple[str, str, str, str]] = []
-        self._risk_ok: Optional[np.ndarray] = None  # [N] bool
-
-    def invalidate(self) -> None:
-        with self._lock:
-            self._loaded = False
-
-    def _ensure_loaded(self) -> None:
-        if self._loaded:
-            return
-        with self._lock:
-            if self._loaded:
-                return
-            self._load_locked()
-            self._loaded = True
-
-    def _load_locked(self) -> None:
-        conn = get_db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, stage, primary_intent, rewritten_question,
-                           rewritten_answer, risk, embedding
-                    FROM qa_pairs
-                    WHERE embedding IS NOT NULL
-                """)
-                rows = cur.fetchall()
-        finally:
-            release_db_conn(conn)
-
-        N = len(rows)
-        if N == 0:
-            self._matrix = np.empty((0, 0), dtype=np.float32)
-            self._ids = np.empty((0,), dtype=np.int64)
-            self._stages = []
-            self._intents = []
-            self._payloads = []
-            self._risk_ok = np.empty((0,), dtype=bool)
-            return
-
-        # 探测维度 & 存储格式
-        first = rows[0][6]
-        if isinstance(first, (bytes, bytearray, memoryview)):
-            dim = len(first) // 4
-            is_bytes = True
-        else:
-            dim = len(first)
-            is_bytes = False
-
-        # 预分配，避免 vstack 类型推断开销
-        mat = np.empty((N, dim), dtype=np.float32)
-        ids = np.empty((N,), dtype=np.int64)
-        stages: List[str] = []
-        intents: List[str] = []
-        payloads: List[Tuple[str, str, str, str]] = []
-        risk_ok = np.empty((N,), dtype=bool)
-
-        for i, r in enumerate(rows):
-            v = r[6]
-            if is_bytes:
-                mat[i] = np.frombuffer(v, dtype=np.float32)
-            else:
-                mat[i] = np.asarray(v, dtype=np.float32)
-            ids[i] = r[0]
-            stages.append(r[1])
-            intents.append(r[2])
-            payloads.append((r[1], r[2], r[3], r[4]))
-            risk_ok[i] = r[5] != "High"
-
-        # 一次性归一化，零向量保护
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        mat /= norms
-
-        self._matrix = mat
-        self._ids = ids
-        self._stages = stages
-        self._intents = intents
-        self._payloads = payloads
-        self._risk_ok = risk_ok
-        log.info(
-            f"embedding 索引加载完成 | N={N} D={dim} "
-            f"约 {mat.nbytes / 1024 / 1024:.1f} MB"
-        )
-
-    # ---- 掩码构造 ----
-
-    def stage_mask(self, stages: List[str]) -> Optional[np.ndarray]:
-        if not stages:
-            return None
-        self._ensure_loaded()
-        wanted = set(stages)
-        return np.fromiter(
-            (s in wanted for s in self._stages),
-            dtype=bool,
-            count=len(self._stages),
-        )
-
-    def node_mask(self, nodes: Dict[Tuple[str, str], int]) -> Optional[np.ndarray]:
-        if not nodes:
-            return None
-        self._ensure_loaded()
-        wanted = set(nodes.keys())
-        return np.fromiter(
-            ((s, i) in wanted for s, i in zip(self._stages, self._intents)),
-            dtype=bool,
-            count=len(self._stages),
-        )
-
-    # ---- 查询 ----
-
-    def query(
-        self,
-        emb: np.ndarray,
-        mask: Optional[np.ndarray],
-        top_k: int,
-    ) -> List[Tuple[str, str, str, str, float]]:
-        self._ensure_loaded()
-        N = self._matrix.shape[0] if self._matrix is not None else 0
-        if N == 0:
-            return []
-
-        q = np.asarray(emb, dtype=np.float32).ravel()
-        norm = float(np.linalg.norm(q))
-        if norm == 0:
-            return []
-        q = q / norm
-
-        sims = self._matrix @ q  # [N]
-
-        effective = self._risk_ok if mask is None else (mask & self._risk_ok)
-        valid = int(effective.sum())
-        if valid == 0:
-            return []
-
-        k = min(max(1, int(top_k)), valid)
-
-        if not effective.all():
-            sims = np.where(effective, sims, -np.inf)
-
-        if k < N:
-            idx = np.argpartition(-sims, k - 1)[:k]
-        else:
-            idx = np.arange(N)
-        idx = idx[np.argsort(-sims[idx])]
-
-        out: List[Tuple[str, str, str, str, float]] = []
-        for i in idx:
-            s = float(sims[i])
-            if not np.isfinite(s):
-                break
-            out.append((*self._payloads[i], s))
-        return out
-
-
-_index: Optional[_EmbeddingIndex] = None
-_index_lock = threading.Lock()
-
-
-def get_embedding_index() -> _EmbeddingIndex:
-    global _index
-    if _index is not None:
-        return _index
-    with _index_lock:
-        if _index is None:
-            _index = _EmbeddingIndex()
-    return _index
-
-
-def invalidate_embedding_index() -> None:
-    """写入 / 删除 embedding 后调用，下次查询时自动重建。"""
-    if _index is not None:
-        _index.invalidate()
 
 
 # ---------------- Embedder (remote TEI only) ----------------
@@ -427,7 +243,6 @@ class _BaseEmbedder:
         raise NotImplementedError
 
     def health_check(self) -> None:
-        """发一次最小请求验证服务可用；失败抛异常。"""
         self.encode(["ping"], normalize_embeddings=False)
 
 
@@ -453,9 +268,6 @@ class _TEIEmbedder(_BaseEmbedder):
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
 
-        # ⚠️ 顺序关键：先建线程池，再探测维度
-        # _probe_dims() 在 /info 失败时会走 encode() 探针，
-        # encode() 需要 self._pool；否则会 AttributeError。
         self._pool = ThreadPoolExecutor(
             max_workers=self._concurrency, thread_name_prefix="emb-tei"
         )
@@ -470,15 +282,10 @@ class _TEIEmbedder(_BaseEmbedder):
 
     @staticmethod
     def _resolve_endpoint(url: str, style: str) -> Tuple[str, str]:
-        """
-        返回 (完整 endpoint URL, 实际风格)。
-        style 传入 auto 时按 URL 后缀判断；显式 native/openai 时补全路径。
-        """
         u = (url or "").strip().rstrip("/")
         if not u:
             raise ValueError("EMBEDDING_TEI_URL 为空")
 
-        # 显式指定风格：优先补全路径
         if style == "openai":
             if u.endswith("/v1/embeddings") or u.endswith("/embeddings"):
                 return u, "openai"
@@ -489,22 +296,13 @@ class _TEIEmbedder(_BaseEmbedder):
                 return u, "native"
             return f"{u}/embed", "native"
 
-        # auto：根据后缀判断
         if u.endswith("/v1/embeddings") or u.endswith("/embeddings"):
             return u, "openai"
         if u.endswith("/embed"):
             return u, "native"
-        # base URL 默认走 native（TEI 官方部署最常见）
         return f"{u}/embed", "native"
 
-    # ---------- 维度探测 ----------
     def _probe_dims(self) -> None:
-        """
-        探测维度：
-          - native 风格优先 GET {base}/info（零推理成本）
-          - 其余或 /info 不可用时，走一次真实 encode 探针
-        探测失败不影响功能：get_sentence_embedding_dimension() 会再次尝试。
-        """
         if self._style == "native":
             base = (
                 self._endpoint[: -len("/embed")]
@@ -516,11 +314,8 @@ class _TEIEmbedder(_BaseEmbedder):
                 if r.ok:
                     info = r.json()
                     for key in (
-                        "dimensions",
-                        "model_dims",
-                        "hidden_size",
-                        "dim",
-                        "embedding_dimension",
+                        "dimensions", "model_dims", "hidden_size",
+                        "dim", "embedding_dimension",
                     ):
                         if key in info:
                             self._dims = int(info[key])
@@ -532,16 +327,13 @@ class _TEIEmbedder(_BaseEmbedder):
             except Exception as e:
                 log.debug(f"/info 探测失败，将回退 probe embed: {e}")
 
-        # 兜底：发一次真实 embed 探针
         try:
             v = self.encode("probe", normalize_embeddings=False)
             self._dims = int(np.asarray(v).shape[-1])
             log.info(f"Embedding dims={self._dims}（probe embed, style={self._style}）")
         except Exception as e:
-            # 非致命：get_sentence_embedding_dimension() 会再次尝试
             log.debug(f"dim 探测失败（首次 encode 时会重试）: {e}")
 
-    # ---------- HTTP 请求 ----------
     def _post_embed(self, batch: List[str]) -> List[List[float]]:
         last_exc: Optional[Exception] = None
         for attempt in range(self._retry_max):
@@ -582,8 +374,6 @@ class _TEIEmbedder(_BaseEmbedder):
         assert last_exc is not None
         raise last_exc
 
-    # ---------- encode ----------
-
     def encode(self, texts, normalize_embeddings: bool = True) -> np.ndarray:
         single = isinstance(texts, str)
         batch_texts = [texts] if single else list(texts)
@@ -617,7 +407,6 @@ class _TEIEmbedder(_BaseEmbedder):
 
     def get_sentence_embedding_dimension(self) -> int:
         if self._dims is None:
-            # 再试一次（可能是首次构造时 TEI 未就绪）
             self._probe_dims()
         if self._dims is None:
             v = self.encode("probe", normalize_embeddings=False)
@@ -626,11 +415,6 @@ class _TEIEmbedder(_BaseEmbedder):
 
 
 def get_embedder() -> _BaseEmbedder:
-    """
-    仅支持远程 embedding 模式：
-      - 服务可以是 TEI 原生 /embed 或任意 OpenAI 兼容 /v1/embeddings
-      - 进程内不加载任何本地模型
-    """
     global _embedder
     if _embedder is not None:
         return _embedder
